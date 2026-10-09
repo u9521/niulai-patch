@@ -1,0 +1,368 @@
+# Removes UI components from MuMuNxMain.exe entirely, rather than hiding them.
+#
+# Every site here was located in a live x64dbg session (see
+# doc/analysis/debugging.md) and cross-checked against the static image.  The
+# method:
+#
+#   * break on the *body* of Qt5Core's setObjectName, with a condition that
+#     keeps only callers inside mumunxmain.exe, and redirect the log to a file;
+#   * read the widget name that follows each construction, which identifies the
+#     widget without guesswork.
+#
+# How each site is located
+# ------------------------
+# The MSVC compiler emits the *same* instruction sequence for adjacent widgets
+# in a title-bar builder, so two sites can be byte-identical apart from the
+# displacement of one indirect call.  No byte signature can separate them on its
+# own.
+#
+# The discriminator is the widget's own object-name literal, which each block
+# assigns via `setObjectName` a short distance before the layout call.  Every
+# entry below therefore carries a `locate` of kind `string-ref` naming that
+# literal ("mainFaqMenuItem", "leftMuMuRemoteBtn", ...), and the signature is
+# used to *verify* the site the locator found rather than to find it.
+#
+# The rule is a conjunction, and that is what makes it work: the patch resolves
+# only if exactly one (reference, site) pair exists.  Several of these literals
+# are referenced from more than one place -- "avatarButton" from six -- but only
+# one reference of each has the patch's signature within its window.
+#
+# This replaced `locate_rva` (an absolute address).  The address was
+# unambiguous but was invalidated by any rebuild; the object name is not.  See
+# `tests/test_robustness.py`, which measures the difference: a 0x40-byte shift
+# of the image broke 9 of these 9 before, and breaks none now.
+#
+# Why the replacement is NOPs
+# ---------------------------
+# The surrounding code assumes the widget exists: `setObjectName` dereferences
+# `this` immediately (`mov rbx, [rcx+8]` with no null check), and two
+# `QObject::connect` calls wire up its click handlers straight afterwards.
+# Making the *construction* fail would therefore crash, and so would nulling
+# the pointer.  Replacing the layout insertion instead leaves the widget fully
+# constructed, named and connected, but never added to any layout -- so it is
+# never laid out, never painted, and takes no space.  Same-length, so nothing
+# relocates.
+
+[profile]
+name = "remove-components"
+description = "Remove MuMu launcher UI components: the account avatar button and five title-bar dropdown menu items (消息中心, 兑换中心, 常见问题, 下载掌上MuMu)"
+# Required, not optional: patching MuMuNxMain.exe strips its Authenticode blob,
+# which arms the self-integrity check that spawns CPU-burning threads.  The
+# dependency is declared here so it cannot be forgotten at the command line.
+requires = ["no-integrity-punish"]
+# Vendor build these offsets were authored against (see pe/buildid.py).
+# Diagnostic only: a mismatch warns and never blocks.  Regenerate with
+# `mumu-patch rebase` after a MuMu update.
+build = "8b142aee08fad65f"
+
+# -- Account avatar button (the boxed circle, top right) ---------------------
+#
+# Live-session trace of the construction:
+#
+#   call NX::NxPushButton2::NxPushButton2(WidgetData, QWidget*)   @0x14ae3e
+#   lea  "avatarButton"                                           @0x14ae5c
+#   QString::fromAscii_helper                                     @0x14ae63
+#   QObject::setObjectName("avatarButton")                        @0x14ae76
+#   QObject::connectImpl  x2   (click handlers)                   @0x14af0c / @0x14afa1
+#   QBoxLayout::addWidget                                         @0x14afc1   <-- removed
+#
+# The `lea` at 0x14ae5c is also one of the six references to the name, where it
+# reads as a findChild lookup.  The constructor call sits 9 bytes before it,
+# which is why scanning only the `lea` neighbourhood gives the wrong answer.
+# The `locate` window is centred on the `lea "avatarButton"` at 0x14ae5c, which
+# is what the locator anchors on.  The signature itself begins 15 bytes before
+# the `call` being replaced, at the `mov r9d, 0x84` that opens the same inline
+# addWidget sequence -- so the window has to be wide enough to span the distance
+# between the two (0x156 bytes, hence window = 0x200).
+# The whole 6-byte indirect call is wildcarded, not just its displacement:
+# `replace` overwrites all six bytes with NOPs, so a signature that pinned
+# `FF 15` would stop matching once applied and the patch would become
+# undetectable.  Everything the patch does not touch stays literal.
+[[patch]]
+id = "avatar-button"
+description = "Stop the account avatar button from being added to the title bar"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "avatarButton", window = 0x200 }
+signature = "41 B9 84 00 00 00 45 33 C0 48 8B D3 48 8B CE ?? ?? ?? ?? ?? ?? 90 48 8D 4D 10 E8"
+expect = "41 B9 84 00 00 00 45 33 C0 48 8B D3 48 8B CE FF 15 09 45 AE 01 90 48 8D 4D 10 E8"
+replace = "41 B9 84 00 00 00 45 33 C0 48 8B D3 48 8B CE 90 90 90 90 90 90 90 48 8D 4D 10 E8"
+known_rvas = ["0x14afb2"]
+
+
+# ===========================================================================
+# Title-bar dropdown menu items  (see doc/analysis/components.md)
+# ===========================================================================
+#
+# The dropdown is a native QMenu named "MainMenu" (0x168121), built by one
+# function spanning RVA 0x16803e-0x16939c.  Each item is a self-contained
+# block ending in a call to a factory that allocates the item and attaches it:
+#
+#   call QMetaObject::tr                  ; the visible Chinese label
+#   ...  4 icon records {index, white svg, black svg} ...
+#   call 0xbd43                           ; copy those records into a container
+#   lea  rdx, <name literal>              ; e.g. "mainMessageCenterMenuItem"
+#   call QString::operator=(const char*)
+#   ...  feature-flag test via a `mov al,1; ret` stub ...
+#   lea  r8,[rbp+Y] ; lea rdx,[rbp+Z] ; mov rcx,rdi
+#   call <factory>                        ; <-- creates the item; NOPed below
+#
+# Two sibling factories do the work, and they are the only place a menu item
+# object comes into existence:
+#
+#   0x462310  via thunk 0x1ec3b  allocates 0xC8  -> 消息中心 only
+#   0x461c80  via thunk 0x2c5c   allocates 0xC8  -> the other five
+#
+# NOPing the *call site* means the item is never created, so it is genuinely
+# absent from the menu rather than present-but-blank.
+#
+# Why NOT the `call 0xbd43`
+# -------------------------
+# Patching `call 0xbd43` does not work, and the reason is worth recording: it
+# looks like the call that appends the item to the menu, and a live run confirms
+# the menu is completely unchanged by patching it.  Resolving the thunk shows
+# why -- 0x13229a0 is a container range-fill loop:
+#
+#   imul rdi, r8 ; add rdi, rcx ; ... loop: call rdx ; dec rbx
+#
+# i.e. `std::vector`/`QList`-style bulk insertion, with edx=0x18 (24-byte
+# elements) and r8d=4 (four of them) matching the four icon records above it.
+# It touches no widget and no QMenu, so patching it has no visible effect.
+#
+# Why this is safe
+# ----------------
+# The factory's return value is discarded: the instruction right after every
+# call is `mov rcx,[rbp+...]`, which overwrites rax, and the following code is
+# null-guarded (`test rcx,rcx` / `je`).  Nothing consumes the result, so
+# skipping the call cannot leave a dangling pointer or garbage handle.  The
+# replacement is the same length (5 bytes), so nothing relocates.
+#
+# Why a plain signature is not enough
+# -----------------------------------
+# The redemption, setting, FAQ and about call sites are byte-identical across
+# the whole 16-byte window:
+#
+#   48 8D 55 20 48 8B CF E8 ?? ?? ?? ?? 90 48 8B 8D
+#
+# so a bare scan returns four matches and this project treats ambiguity as
+# fatal.  What separates them is the object name each block assigns a short way
+# earlier -- "mainMessageCenterMenuItem", "mainRedemptionCenterMenuItem",
+# "mainFaqMenuItem", "mainDownloadAppMenuItem" -- so each patch carries a
+# `locate` of kind `string-ref` on its own name and the signature verifies the
+# result.  Every one of those literals is unique in the image, and each sits
+# exactly 0x50 bytes before its call site, which is why window = 0x100 is
+# comfortable.
+#
+# Each signature starts 7 bytes before the call, at `lea rdx,[rbp+..]`, and
+# wildcards the 5-byte call (bytes 7..11) because `replace` overwrites exactly
+# those -- pinning them would make the patch undetectable once applied, which
+# `Patch.validate()` rejects per byte at load time.
+#
+# 关于 MuMu and 设置中心 are deliberately absent: both are kept, so no patch is
+# written for their create calls (0x169313 and 0x168a6f).
+
+# -- 消息中心 (Message Center) ----------------------------------------------
+#   create call at 0x16842b -> factory 0x462310 (via thunk 0x1ec3b)
+[[patch]]
+id = "menu-message-center"
+description = "Remove the 消息中心 item from the title-bar dropdown menu"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "mainMessageCenterMenuItem", window = 0x100 }
+signature = "48 8D 55 90 48 8B CF ?? ?? ?? ?? ?? 90 48 8B 8D"
+expect = "48 8D 55 90 48 8B CF E8 0B 68 EB FF 90 48 8B 8D"
+replace = "48 8D 55 90 48 8B CF 90 90 90 90 90 90 48 8B 8D"
+known_rvas = ["0x168424"]
+
+# -- 兑换中心 (Redemption Center) -------------------------------------------
+#   create call at 0x168778 -> factory 0x461c80 (via thunk 0x2c5c)
+# This is the *dropdown's* 兑换中心 (`mainRedemptionCenterMenuItem`).  The tray
+# has a separate entry with its own identifier in a different function; see the
+# note at the end of this file.
+[[patch]]
+id = "menu-redemption-center"
+description = "Remove the 兑换中心 item from the title-bar dropdown menu"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "mainRedemptionCenterMenuItem", window = 0x100 }
+signature = "48 8D 55 20 48 8B CF ?? ?? ?? ?? ?? 90 48 8B 8D"
+expect = "48 8D 55 20 48 8B CF E8 DF A4 E9 FF 90 48 8B 8D"
+replace = "48 8D 55 20 48 8B CF 90 90 90 90 90 90 48 8B 8D"
+known_rvas = ["0x168771"]
+
+# -- 常见问题 (FAQ) ----------------------------------------------------------
+#   create call at 0x168d66 -> factory 0x461c80 (via thunk 0x2c5c)
+# Byte-identical to the redemption and setting sites apart from the call
+# displacement, hence the anchor.
+[[patch]]
+id = "menu-faq"
+description = "Remove the 常见问题 item from the title-bar dropdown menu"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "mainFaqMenuItem", window = 0x100 }
+signature = "48 8D 55 20 48 8B CF ?? ?? ?? ?? ?? 90 48 8B 8D"
+expect = "48 8D 55 20 48 8B CF E8 F1 9E E9 FF 90 48 8B 8D"
+replace = "48 8D 55 20 48 8B CF 90 90 90 90 90 90 48 8B 8D"
+known_rvas = ["0x168d5f"]
+
+# -- 下载掌上MuMu (Download the mobile app) ---------------------------------
+#   create call at 0x169035 -> factory 0x461c80 (via thunk 0x2c5c)
+# This item uses `[rbp-0x30]` rather than `[rbp+0x20]`, so its signature is
+# unique.
+[[patch]]
+id = "menu-download-app"
+description = "Remove the 下载掌上MuMu item from the title-bar dropdown menu"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "mainDownloadAppMenuItem", window = 0x100 }
+signature = "48 8D 55 D0 48 8B CF ?? ?? ?? ?? ?? 90 48 8B 8D"
+expect = "48 8D 55 D0 48 8B CF E8 22 9C E9 FF 90 48 8B 8D"
+replace = "48 8D 55 D0 48 8B CF 90 90 90 90 90 90 48 8B 8D"
+known_rvas = ["0x16902e"]
+
+# ===========================================================================
+# Left navigation rail  (see doc/analysis/components.md)
+# ===========================================================================
+#
+# The rail is built by one function spanning RVA 0x146b80-0x147900.  Each
+# button is created, named with setObjectName, added to a QButtonGroup
+# (QButtonGroup::addButton, 4 calls) and then inserted into the rail's
+# QBoxLayout with QBoxLayout::addWidget (5 calls).  The five addWidget sites:
+#
+#   0x146c38  leftDeviceBtn       设备     KEPT (no patch)
+#   0x146f79  leftMuMuRemoteBtn   远控     removed
+#   0x147200  leftLobsterBtn      (not in the screenshot)  left alone
+#   0x14749b  leftCloudPhoneBtn   云手机   removed
+#   0x1477aa  feedbackBtn         反馈     removed
+#
+# Note the build order is not the on-screen order: leftLobsterBtn is
+# constructed before leftCloudPhoneBtn.
+#
+# NOPing the addWidget call leaves the button fully constructed, named,
+# connected and still a member of the button group -- it is simply never laid
+# out, so it is not painted and takes no space.  This is the same technique
+# already proven by `avatar-button`, and it is the safe choice here for the
+# same reason: the surrounding code assumes the widget exists (setObjectName
+# runs on it and QButtonGroup::addButton registers it).
+#
+# Note the guards inside this function are *styling* branches, not visibility:
+# the test at 0x146c51-0x146c69 chooses between the normal and clawbox icon
+# sets for the same button, and both branches converge on the same addWidget.
+# Patching a guard would therefore change the icon theme, not remove anything.
+#
+# Why a plain signature is not enough
+# -----------------------------------
+# All five addWidget sites compile to the same 12-byte prologue:
+#
+#   45 8B CD 45 33 C0 48 8B D3 48 8B CE FF 15
+#
+# so the patched sites (`leftMuMuRemoteBtn`, `leftCloudPhoneBtn`,
+# `feedbackBtn`) each match **seven** places in the image; `leftDeviceBtn`
+# matches two, and is the one that must stay unpatched.  The object-name
+# literal each block assigns identifies it: "leftMuMuRemoteBtn" at 0xcb before
+# its site, "leftCloudPhoneBtn" at 0x34, "feedbackBtn" at 0x34.  A `locate` of
+# kind `string-ref` on that name, plus the signature as verification, resolves
+# each to exactly one site.
+#
+# The call being NOPed is an indirect `call [rip+disp]` (FF 15 disp32), i.e.
+# six bytes, wildcarded in the signature because `replace` overwrites exactly
+# those.  Each signature is 18 bytes: the 12-byte prologue plus the call.
+
+# -- 设备 (Device): KEPT ------------------------------------------------------
+#   addWidget at 0x146c38, prologue 0x146c2c
+# 设备 is the device-list page and is deliberately retained, so no patch is
+# written for its addWidget.  Its site is recorded here only so a future edit
+# knows which address must stay untouched -- `nav-keep-device` in the tests
+# asserts that no patch ever claims 0x146c2c.
+
+# -- 远控 (Remote control) ---------------------------------------------------
+#   addWidget at 0x146f79, prologue anchored at 0x146f6d
+[[patch]]
+id = "nav-remote"
+description = "Remove the 远控 button from the left navigation rail"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "leftMuMuRemoteBtn", window = 0x100 }
+signature = "45 8B CD 45 33 C0 48 8B D3 48 8B CE ?? ?? ?? ?? ?? ??"
+expect = "45 8B CD 45 33 C0 48 8B D3 48 8B CE FF 15 51 85 AE 01"
+replace = "45 8B CD 45 33 C0 48 8B D3 48 8B CE 90 90 90 90 90 90"
+known_rvas = ["0x146f6d"]
+
+# -- 云手机 (Cloud phone) ----------------------------------------------------
+#   addWidget at 0x14749b, prologue anchored at 0x14748f
+#
+# Careful: the build order in this function is NOT the on-screen order.
+# leftLobsterBtn is constructed *before* leftCloudPhoneBtn, so the addWidget at
+# 0x147200 belongs to the lobster button (not in the screenshot, deliberately
+# left alone) and the cloud-phone one is at 0x14749b.  The mapping was
+# confirmed by scanning back from each addWidget to the nearest
+# setObjectName-bearing name literal.
+[[patch]]
+id = "nav-cloudphone"
+description = "Remove the 云手机 button from the left navigation rail"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "leftCloudPhoneBtn", window = 0x100 }
+signature = "45 8B CD 45 33 C0 48 8B D3 48 8B CE ?? ?? ?? ?? ?? ??"
+expect = "45 8B CD 45 33 C0 48 8B D3 48 8B CE FF 15 2F 80 AE 01"
+replace = "45 8B CD 45 33 C0 48 8B D3 48 8B CE 90 90 90 90 90 90"
+known_rvas = ["0x14748f"]
+
+# -- 反馈 (Feedback) ---------------------------------------------------------
+#   addWidget at 0x1477aa, prologue anchored at 0x14779e
+# Note this item is not added to the button group (it is a plain button), so
+# there is no addButton call for it -- the addWidget is the only site.
+[[patch]]
+id = "nav-feedback"
+description = "Remove the 反馈 button from the bottom of the left navigation rail"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "feedbackBtn", window = 0x100 }
+signature = "45 8B CD 45 33 C0 48 8B D3 48 8B CE ?? ?? ?? ?? ?? ??"
+expect = "45 8B CD 45 33 C0 48 8B D3 48 8B CE FF 15 20 7D AE 01"
+replace = "45 8B CD 45 33 C0 48 8B D3 48 8B CE 90 90 90 90 90 90"
+known_rvas = ["0x14779e"]
+
+# ===========================================================================
+# System tray: 兑换中心  (see doc/analysis/components.md)
+# ===========================================================================
+#
+# Unlike the title-bar dropdown, the tray's 兑换中心 has a real skip guard
+# already compiled into the binary, so no new control flow is needed.
+#
+# The tray is built in RVA 0x10d0e0-0x10dda9.  The top-level 兑换中心 entry is
+# the block at 0x10d8e7-0x10db63, whose label comes from
+# `tr("RedemptionCenter")` at 0x10d933.  It is guarded twice:
+#
+#   0x10d8e7  mov  rax, [rdi]           ; the tray object
+#   0x10d8ea  mov  rcx, [rax+0x160]
+#   0x10d8f1  test rcx, rcx
+#   0x10d8f4  je   0x10dbfc             ; <-- patched to an unconditional jmp
+#   0x10d8fa  mov  edx, 0x54
+#   0x10d8ff  call 0x37a1               ; a pure predicate (reads [rcx+0xa8])
+#   0x10d904  test al, al
+#   0x10d906  je   0x10dbfc             ; already skips when the predicate is false
+#
+# Both exits land on 0x10dbfc, which is where the *next* tray entry begins, so
+# jumping there skips exactly this entry and nothing else.  Turning the first
+# `je` into an unconditional `jmp` therefore removes the entry by taking a path
+# the binary already contains.
+#
+# Why not NOP something inside the block
+# --------------------------------------
+# The block's only REL calls are the container fill (`call 0xbd43` at 0x10db08)
+# and a widget-data helper (`call 0xb82f` at 0x10daac) -- the same pair the
+# title-bar dropdown uses, where patching the fill was proven to have no visible
+# effect.  The guard is the reliable lever here because it is a real control-flow
+# branch that already surrounds the whole entry.
+#
+# This is *not* the same as the submenu flyout: the block at 0x10db63
+# (`trayRedemptionCenterMenuItem`) builds the popup's child actions into the
+# submenu at [obj+0x4f8] and then calls QMenu::exec at 0x10dd3b.  Skipping the
+# top-level entry means that flyout is never reachable, so no separate patch for
+# it is required.
+#
+# The 5-byte `jmp rel32` plus one NOP keeps the replacement the same length as
+# the original 6-byte `je rel32`, so nothing relocates.  The wildcarded bytes in
+# the signature are exactly the six that `replace` overwrites.
+[[patch]]
+id = "tray-redemption-center"
+description = "Remove the 兑换中心 entry from the system-tray menu"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "trayExitPlayerMenuItem", window = 0x100 }
+signature = "48 8B 07 48 8B 88 60 01 00 00 48 85 C9 ?? ?? ?? ?? ?? ?? BA 54 00 00 00 E8 9D 5E EF FF 84 C0 0F 84 F0 02 00 00 C6"
+expect = "48 8B 07 48 8B 88 60 01 00 00 48 85 C9 0F 84 02 03 00 00 BA 54 00 00 00 E8 9D 5E EF FF 84 C0 0F 84 F0 02 00 00 C6"
+replace = "48 8B 07 48 8B 88 60 01 00 00 48 85 C9 E9 03 03 00 00 90 BA 54 00 00 00 E8 9D 5E EF FF 84 C0 0F 84 F0 02 00 00 C6"
+known_rvas = ["0x10d8e7"]

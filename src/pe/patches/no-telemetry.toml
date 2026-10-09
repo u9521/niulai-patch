@@ -1,0 +1,97 @@
+# Conservative profile: neutralises the analytics/telemetry reporting paths that
+# are plain native code in MuMuNxMain.exe.
+#
+# Every signature and RVA here was located in a live x64dbg session against
+# MuMuNxMain.exe 6.8.2.0 (module base 0x7FF6593F0000) and cross-checked against
+# the static image.  Each `lea` displacement below was independently recomputed
+# and asserted to resolve to EMPTY_RVA -- see doc/analysis/telemetry.md.
+#
+# EMPTY_RVA = 0x1619000 is the start of a 334-byte NUL run in .rdata, preceded
+# by linker 0xCC padding.  It is inert mapped read-only memory, so pointing a
+# string argument at it yields a valid empty C string.
+#
+# Two fields work together to keep matching safe:
+#
+#   locate     finds the site from a fact that survives a rebuild.  Each of
+#              these three reporters loads its endpoint URL with
+#              `lea rdx,[rip+disp]`, and the URL string itself is unique in the
+#              image, so the locator anchors on the literal and the signature
+#              verifies the code next to it.  See pe/locate.py.
+#   signature  wildcards the 4-byte `lea` displacement, because the patch
+#              rewrites exactly those bytes.  A fully literal signature would
+#              match only the pristine file, so the tool could neither report
+#              "already applied" nor re-run idempotently.
+#
+# Before the semantic locators this profile used a byte `anchor`: a literal run
+# immediately before the match.  That worked, but it pinned one link's code
+# bytes, so a rebuild that shifted anything invalidated it.  The URL strings do
+# not move when the code does.
+
+[profile]
+name = "no-telemetry"
+description = "Disable MuMu's analytics and crash-reporting endpoints in MuMuNxMain.exe"
+# Required, not optional: patching MuMuNxMain.exe strips its Authenticode blob,
+# which arms the self-integrity check that spawns CPU-burning threads.  The
+# dependency is declared here so it cannot be forgotten at the command line.
+requires = ["no-integrity-punish"]
+# Vendor build these offsets were authored against (see pe/buildid.py).
+# Diagnostic only: a mismatch warns and never blocks.  Regenerate with
+# `mumu-patch rebase` after a MuMu update.
+build = "8b142aee08fad65f"
+
+# -- Sensors Analytics (神策) primary endpoint -------------------------------
+# Compiler output for both reporters:
+#   lea  rax, [rip+disp]   ; 48 8D 05 <disp32>  -> the test URL
+#   lea  rdx, [rip+disp]   ; 48 8D 15 <disp32>  -> the production URL
+#   test ebx, ebx
+#   cmovnz rdx, rax        ; sensors_debug != 0 -> use the test URL
+#   mov  rcx, rsi
+#   call QString::operator=(char const *)
+#
+# The 18-byte window covers BOTH `lea`s, so neither branch can resolve to a live
+# endpoint.  Rewriting only the production `lea` is not enough: it works on a
+# default install, because `sensors_debug` is normally unset, but it leaves a
+# machine with that value set still reporting to the test endpoint.
+#
+# The locators anchor on the registry key, NOT the URL, and that is a
+# requirement rather than a preference: the patch destroys the URL reference it
+# rewrites, so a URL anchor resolves on the pristine file and then fails to
+# resolve on the patched one -- `verify` would report the patch lost and a
+# re-run could not find the site.  Each function opens its own registry key, so
+# the key is both unique and *untouched* by the patch.
+[[patch]]
+id = "shence-endpoint"
+description = "Point the Sensors Analytics reporter at an empty endpoint"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "HKEY_CURRENT_USER\\Software\\Netease\\MuMuPlayer", window = 0x200 }
+signature = "48 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 85 DB 48 0F"
+expect = "48 8D 05 02 4E 1B 01 48 8D 15 3B 4E 1B 01 85 DB 48 0F"
+replace = "48 8D 05 D2 3E 13 01 48 8D 15 CB 3E 13 01 85 DB 48 0F"
+known_rvas = ["0x4e5127"]
+
+# -- Second event-reporting endpoint (mumu_player_*) ------------------------
+[[patch]]
+id = "gearup-endpoint"
+description = "Point the event reporter at an empty endpoint"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "HKEY_CURRENT_USER\\Software\\Netease\\MuMuNx", window = 0x200 }
+signature = "48 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 85 DB 48 0F"
+expect = "48 8D 05 B2 52 1B 01 48 8D 15 FB 52 1B 01 85 DB 48 0F"
+replace = "48 8D 05 92 42 13 01 48 8D 15 8B 42 13 01 85 DB 48 0F"
+known_rvas = ["0x4e4d67"]
+
+# -- Crash report upload (mumu.nie.netease.com/api/crashrpt) ----------------
+#   lea rdx, [rip+disp]    ; crashrpt URL
+#   lea rcx, [rbp-0x80]
+#   call ...               ; the call's relative target is stable, and pinning
+#                          ; it is what makes this site unique (the bare
+#                          ; `lea rdx` shape alone matches 628 places).
+[[patch]]
+id = "crashrpt-endpoint"
+description = "Point the crash-report uploader at an empty endpoint"
+file = "nx_main/MuMuNxMain.exe"
+locate = { kind = "string-ref", value = "mumu.nie.netease.com", window = 0x200 }
+signature = "48 8D 15 ?? ?? ?? ?? 48 8D 4D 80 E8 38 5A 36 FF"
+expect = "48 8D 15 61 52 A3 00 48 8D 4D 80 E8 38 5A 36 FF"
+replace = "48 8D 15 41 C1 97 00 48 8D 4D 80 E8 38 5A 36 FF"
+known_rvas = ["0xc9ceb8"]

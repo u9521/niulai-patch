@@ -1,0 +1,124 @@
+# Neutralises the analytics/telemetry reporting in MuMuNxDevice.exe.
+#
+# Why this is needed at all
+# -------------------------
+# `no-device-integrity-punish` stops the punishment a tampered build receives,
+# but it does not stop the *reporting*.  The last thing the punishment block
+# does is queue sub_140F7B950, which sends a statistics event named
+# **MainProgramCrackDetection** through the NemuStatistics service; its sibling
+# sub_1410F4F90 reports **MainProgramAuthVerify** with status_code / error_code /
+# failure_reason / error_msg.  So "this build was tampered with" is telemetered
+# even once the CPU burn and the input corruption are gone.
+#
+# Those events -- like every other event this binary emits -- are posted to
+# Sensors Analytics, whose host is chosen by `UrlManager`:
+#
+#   sub_14078EA00  UrlManager::getNXSensorsHost   (HKCU\...\Netease\MuMuNx)
+#   sub_14078EDC0  UrlManager::getSensorsHost     (HKCU\...\Netease\MuMuPlayer)
+#
+# Each reads a `sensors_debug` value out of its own registry key and picks the
+# test or production endpoint accordingly:
+#
+#   v6 = "https://.../sa?project=...prod";   // lea rdx
+#   if ( sensors_debug ) v6 = "...test";     // lea rax + cmovnz rdx, rax
+#   QString::operator=(a2, v6);
+#
+# `getNXSensorsHost` is the one that matters for the device window: it is what
+# `NxDevicePresenterImpl::init` (sub_140E0BDB0) feeds into the statistics
+# service before firing its "statistics.ready" event, and what sub_14124E9A0
+# hands to the same service.
+#
+# There is no config switch for this.  The 82 `feature.*.enabled` keys this
+# binary understands contain nothing telemetry-related (checked: no
+# feature.*statistics/report/track/log/sensors/shence/data/upload/event*), and
+# `sensors_debug` only chooses *which* endpoint is used, not whether reporting
+# happens at all.  The endpoints themselves are the only lever.
+#
+# The lever
+# ---------
+# Point both URLs at an empty string, so the statistics service has no host to
+# post to.  This is the same technique as `no-telemetry.toml` uses on
+# MuMuNxMain.exe, with one difference worth noting: that profile rewrites only
+# the production `lea` and leaves the `cmovnz`-selected test URL reachable, so a
+# machine with `sensors_debug` set still reports.  Here both `lea`
+# displacements are rewritten in one window, so neither branch can resolve to a
+# live endpoint.
+#
+# The window is 18 bytes and covers exactly the two instructions:
+#
+#   48 8D 05 <disp32>   lea rax, [test URL]
+#   48 8D 15 <disp32>   lea rdx, [prod URL]
+#   85 DB               test ebx, ebx
+#   48 0F 45 D0         cmovnz rdx, rax
+#
+# Both displacements are wildcarded in the signature because the patch rewrites
+# them; the `test`/`cmovnz` tail is context and is pinned.  Nothing moves: the
+# two `lea`s keep their length and the select logic is untouched, so the only
+# change is *which string* the register ends up holding.
+#
+# Why the locators anchor on the registry keys, not the URLs
+# ----------------------------------------------------------
+# The obvious anchor would be the endpoint URL itself, and that is what
+# `no-telemetry.toml` originally did.  It cannot work for a patch that rewrites
+# *both* `lea`s, and the reason is worth stating plainly: the anchor is the thing
+# the patch destroys.  `pe.locate.resolve` finds candidate sites from references
+# to the anchor string, so once the `lea` that referenced the URL has been
+# rewritten to point at the empty string, there is no reference left to find --
+# `verify` reports the patch as lost and a re-run cannot locate the site at all.
+#
+# The registry key strings do not have that problem: each function opens its own
+# key, so `HKCU\...\Netease\MuMuPlayer` is referenced only by `getSensorsHost`
+# and `HKCU\...\Netease\MuMuNx` only by `getNXSensorsHost`, and neither is
+# touched by the patch.  Verified on the vendor build: each is a single `lea`
+# reference in the whole image, and each still resolves after the patch is
+# applied.
+#
+# The empty target
+# ----------------
+# `0x1a5b115` is 0x10b bytes into a 267-byte run of NULs in `.rdata`, i.e.
+# mapped read-only memory whose first byte is a terminator.  Pointing a string
+# argument at it yields a valid empty C string.  (The MuMuNxMain.exe profile uses
+# the same trick at its own `0x1619000`; the RVA is per-binary.)
+#
+# What this does not change
+# -------------------------
+# Only the two host strings are redirected.  The registry reads, the logging,
+# the statistics machinery and every other endpoint in the binary (the account,
+# store and cloud-phone APIs) are untouched -- this profile silences *event
+# reporting*, not the product's functional network traffic.
+
+[profile]
+name = "no-device-telemetry"
+description = "Stop MuMuNxDevice.exe reporting analytics (including the tamper-detection events) to Sensors Analytics"
+# Required, not optional: patching MuMuNxDevice.exe strips its Authenticode
+# blob, which arms the self-integrity check that spawns CPU-burning threads.
+# The dependency is declared here so it cannot be forgotten at the command line.
+requires = ["no-device-integrity-punish"]
+# Vendor build these offsets were authored against (see pe/buildid.py).
+# Diagnostic only: a mismatch warns and never blocks.  Regenerate with
+# `mumu-patch rebase` after a MuMu update.
+build = "bd76ae0490f2acfd"
+
+# -- UrlManager::getSensorsHost (HKCU\...\Netease\MuMuPlayer) ----------------
+[[patch]]
+id = "sensors-host"
+description = "Point the MuMuPlayer Sensors Analytics host at an empty string"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "HKEY_CURRENT_USER\\Software\\Netease\\MuMuPlayer", window = 0x200 }
+signature = "48 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 85 DB 48 0F"
+expect = "48 8D 05 EA 3F 3C 01 48 8D 15 23 40 3C 01 85 DB 48 0F"
+replace = "48 8D 05 57 C2 2C 01 48 8D 15 50 C2 2C 01 85 DB 48 0F"
+known_rvas = ["0x78eeb7"]
+
+# -- UrlManager::getNXSensorsHost (HKCU\...\Netease\MuMuNx) ------------------
+# This is the one the device window actually reports through: its result is
+# handed to the statistics service by NxDevicePresenterImpl::init.
+[[patch]]
+id = "nxsensors-host"
+description = "Point the NxDevice Sensors Analytics host at an empty string"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "HKEY_CURRENT_USER\\Software\\Netease\\MuMuNx", window = 0x200 }
+signature = "48 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 85 DB 48 0F"
+expect = "48 8D 05 9A 44 3C 01 48 8D 15 E3 44 3C 01 85 DB 48 0F"
+replace = "48 8D 05 17 C6 2C 01 48 8D 15 10 C6 2C 01 85 DB 48 0F"
+known_rvas = ["0x78eaf7"]

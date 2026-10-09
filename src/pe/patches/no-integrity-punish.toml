@@ -1,0 +1,171 @@
+# Disarms MuMuNxMain.exe's self-integrity check, which punishes any patched
+# binary by burning CPU forever.
+#
+# Why this profile must accompany every other MuMuNxMain.exe profile
+# -----------------------------------------------------------------
+# The CLI strips the Authenticode blob from a binary whenever it patches it
+# (see `pe.strip_signature`).  MuMuNxMain.exe verifies its *own* Authenticode
+# signature at startup and treats "unsigned" as tampering -- which is exactly
+# what a patched build looks like.  The punishment is not a message box: it
+# spawns a set of detached threads, one of which loops forever on a synthetic
+# floating-point workload, pegging one core per thread.
+#
+# So `remove-components` and `no-telemetry` both *arm* this trap simply by
+# existing.  Apply this profile with them.
+#
+# The check
+# ---------
+# sub_1407198B0 (run once, on a detached thread, queued from startup via
+# QMetaObject::invokeMethodImpl):
+#
+#     QCoreApplication::applicationFilePath(v9);
+#     if ( !sub_140024906(*a1, v9) || !sub_14002DCA4(*a1, v9) )
+#     {
+#         ... decode obfuscated base64 strings, log them ...
+#         sub_140019EDE();   // <-- spawns the CPU burners
+#         sub_14002F1A8();
+#         sub_14000F70E();
+#         sub_140021A58();
+#         ...
+#     }
+#     QString::~QString(v9);
+#
+# The two predicates are the two halves of the check:
+#
+#   sub_140024906 -> sub_14071BB90
+#       WinVerifyTrust(nullptr, &WINTRUST_ACTION_GENERIC_VERIFY_V2, ...)
+#       returns `result != 0x800B0100` -- i.e. TRUE unless the file is
+#       *unsigned*.  A stripped binary is unsigned, so this returns FALSE.
+#
+#   sub_14002DCA4 -> sub_14071BC90
+#       compares the file's Authenticode *signer name* against a constant.
+#       sub_14002BEBD -> sub_14071A900 opens the embedded PKCS#7 with
+#       CryptQueryObject, reads CMSG_SIGNER_INFO_PARAM, finds the signer
+#       certificate with CertFindCertificateInStore(CERT_FIND_SUBJECT_CERT) and
+#       returns CertGetNameStringW(CERT_NAME_SIMPLE_DISPLAY_TYPE) -- the
+#       publisher's display name.  sub_14071BC90 compares that against an
+#       obfuscated constant.
+#
+#       This is a *publisher pin*, not a digest: it asks "is this signed by the
+#       expected vendor?", not "is every byte unchanged?".  The device-side check
+#       has the same shape, which is what confirms the reading.  The two
+#       predicates are complementary -- A catches tampering, B catches re-signing
+#       with a different certificate.
+#
+# Because the condition is `!A || !B`, a stripped (hence patched) binary fails
+# on the first term alone.  Not stripping the signature does not help either:
+# the signature then no longer matches the bytes, WinVerifyTrust returns
+# TRUST_E_BAD_DIGEST (which is not TRUST_E_NOSIGNATURE, so A becomes TRUE) and
+# the second term still fails.  The check has to be disarmed, not satisfied.
+#
+# The CPU burner
+# --------------
+# sub_140019EDE -> sub_14071A3B0 spawns a detached thread running
+# sub_140717D10 -> sub_140718520 -> sub_140718AD0 -> sub_140019EDE ->
+# sub_14071A3B0, which spawns *eleven* more threads (the `++v2 >= 11` bound)
+# and then joins them.  Each of those runs:
+#
+#     sub_1400024A0 -> sub_140717C80 -> ... -> sub_140718A40
+#
+# and sub_140718A40 is an unconditional infinite loop:
+#
+#     while (1) {
+#         v3 = 0.0;
+#         for (i = 0; i < 10000000; ++i)   // 10 million sqrts
+#             v3 += sqrt((double)i);
+#         sub_140024B8B(...);
+#     }
+#
+# The join never returns because the threads never end, so the burn is
+# permanent for the life of the process.  A live sample of an affected process
+# showed six threads each ~17 s of user-mode CPU, all with RIP inside
+# sub_140718A40.
+#
+# The lever
+# ---------
+# The condition `!A || !B` compiles to TWO branches, and both have to be
+# defused -- patching only one leaves the other free to enter the punishment
+# block.  Patching only the second one is a complete no-op, because a stripped
+# binary fails A, which is the *first* branch.
+#
+# sub_1407198B0's decision, in full:
+#
+#   1407198e3  call sub_140024906      ; A: WinVerifyTrust check -> al
+#   1407198e8  test al, al
+#   1407198ea  jz   loc_140719900      ; <-- guard 1: if !A -> punish
+#   1407198ec  lea  rdx, [rbp+var_50]
+#   1407198f0  mov  rcx, [rbx]
+#   1407198f3  call sub_14002DCA4      ; B: signer-name check -> al
+#   1407198f8  test al, al
+#   1407198fa  jnz  loc_140719BB0      ; <-- guard 2: if B -> clean exit
+#   140719900  loc_140719900:          ; the punishment block
+#   ...
+#   140719bb0  loc_140719BB0:          ; the clean epilogue:
+#   140719bb0  lea  rcx, [rbp+var_50]  ;   ~QString, __security_check_cookie,
+#   140719bb4  call QString::~QString  ;   restore rbx, add rsp, pop rbp, retn
+#
+# The patch covers both branches in one 22-byte window:
+#
+#   guard 1  74 14                  -> 90 90                 (never punish)
+#   guard 2  0F 85 B0 02 00 00      -> E9 B1 02 00 00 90     (always exit)
+#
+# With guard 1 removed the code always falls through to B, and with guard 2
+# unconditional it then always leaves for `loc_140719BB0` -- so the punishment
+# block becomes unreachable no matter what A and B return.  Control flows
+# straight down to the function's own epilogue; no block is jumped over, so the
+# MSVC exception state is never bypassed either.
+#
+# `loc_140719BB0` is the path the vendor takes on every legitimate run, so this
+# reuses an edge the binary already contains.  The two jumps are the same
+# length as what they replace (2 -> 2, and 6 -> 5 + 1 NOP), so nothing
+# relocates.  Guard 2's displacement shifts by one (0x2B0 -> 0x2B1) only because
+# `jmp` is a byte shorter than `jnz`; both resolve to 0x140719BB0.
+#
+# What this does not change
+# -------------------------
+# Only the two branches are patched.  The check still runs, still calls
+# WinVerifyTrust and still reads the signer name; it just no longer acts on a
+# negative result.  Nothing else in the startup path is touched.
+
+[profile]
+name = "no-integrity-punish"
+description = "Stop MuMuNxMain.exe's self-integrity check from spawning CPU-burning threads (required with any other MuMuNxMain.exe patch)"
+# This is the base of the dependency graph: every other profile that touches
+# MuMuNxMain.exe requires *this* one, so it must require nothing itself.
+requires = []
+# The vendor build these offsets were authored against (see pe/buildid.py).
+# Purely diagnostic: if the installed MuMuNxMain.exe hashes differently, the
+# tool says so plainly instead of reporting a pile of signature failures.  It
+# never blocks a patch -- the per-patch signature and `expect` checks are the
+# real gate.  Regenerate after a MuMu update with `mumu-patch rebase`.
+build = "8b142aee08fad65f"
+
+[[patch]]
+id = "integrity-check-clean-exit"
+description = "Make the self-integrity check take its own pass path instead of the punishment block"
+file = "nx_main/MuMuNxMain.exe"
+# This is the ONE patch in the project that still uses `locate_rva`, and it is a
+# deliberate, documented exception rather than an oversight.
+#
+# Why it cannot use a semantic locator: the predicate this branch tests calls
+# WinVerifyTrust through a pointer it resolves dynamically at run time.  That
+# symbol appears in no import table at all (verified: CRYPT32.dll is imported
+# only for CertGetNameStringW / CertFindCertificateInStore / CryptQueryObject /
+# CryptMsgGetParam / ...), so there is no import name to anchor on; and no string
+# literal sits within 0x800 bytes, so there is nothing to anchor a string-ref on
+# either.
+#
+# The consequence is honest and bounded: after a section shift this patch fails
+# closed with "bytes at recorded RVA ... do not match the signature, so this is a
+# different build", and `mumu-patch rebase` reports it as needing manual work.
+# tests/test_robustness.py pins both the failure mode and the fact that it is the
+# only patch in this state.
+locate_rva = "0x7198ea"
+# Offsets 0..1 are guard 1 and offsets 16..21 are guard 2 -- exactly the bytes
+# the patch rewrites, so both are wildcarded.  Pinning either would stop the
+# signature matching the moment the patch was applied and `verify` would report
+# it lost.  Everything between them is context the patch never touches.
+signature = "?? ?? 48 8D 55 B0 48 8B 0B E8 AC 43 91 FF 84 C0 ?? ?? ?? ?? ?? ??"
+expect = "74 14 48 8D 55 B0 48 8B 0B E8 AC 43 91 FF 84 C0 0F 85 B0 02 00 00"
+replace = "90 90 48 8D 55 B0 48 8B 0B E8 AC 43 91 FF 84 C0 E9 B1 02 00 00 90"
+known_rvas = ["0x7198ea"]

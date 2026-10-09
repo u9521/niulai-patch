@@ -1,0 +1,540 @@
+# Patches for MuMuNxDevice.exe -- the per-device emulator window.
+#
+# This is a *separate target* from MuMuNxMain.exe.  That binary draws the
+# launcher (device list, title bar, dropdown); this one draws a single running
+# device: its toolbar, and the slide-out menu with 安卓导航键 / 窗口管理 /
+# 远程控制 / 加速服务 / 设备设置 and so on.
+#
+# Both are the same PE family with the same Qt idioms, so the same techniques
+# apply -- but the addresses are unrelated, and a patch written for one binary
+# is meaningless in the other.
+#
+# See doc/analysis/device-window.md.
+
+[profile]
+name = "device-ui"
+description = "Remove side-panel menu entries and the startup ad carousel from the MuMu device window (MuMuNxDevice.exe)"
+# Required, not optional: patching MuMuNxDevice.exe strips its Authenticode
+# blob, which arms the self-integrity check that spawns CPU-burning threads.
+# The dependency is declared here so it cannot be forgotten at the command line.
+#
+# MuMuNxDevice.exe *does* carry a self-integrity check, and it is the same trap
+# as the main binary's.  The check lives at sub_1408DEF90 and, on a patched
+# build, pegs one whole core with eleven detached sqrt threads; see
+# `no-device-integrity-punish.toml` for the evidence.
+requires = ["no-device-integrity-punish"]
+# Vendor build these offsets were authored against (see pe/buildid.py).
+# Diagnostic only: a mismatch warns and never blocks.  Regenerate with
+# `mumu-patch rebase` after a MuMu update.
+build = "bd76ae0490f2acfd"
+
+
+# ===========================================================================
+# Startup splash ad
+# ===========================================================================
+#
+# The splash shown while a device boots is not purely local art: the binary
+# carries a `StartupImageManager` that *downloads* campaign images and caches
+# them under the VM's data/startup directory, and a `StartupBkWidget` that
+# paints them.  That is what puts a changing promotional image (a game banner,
+# with a 去广告 button) on screen at ~38% boot.
+#
+# The observed sequence, from `shell.log`:
+#
+#   [StartupImageManager::fetchImageInfos_] url: .../api/v2/campaign/launcher/launching
+#   [StartupImageManager::parseImageInfos_] campaign id: kNTMmr
+#   [StartupImageManager::downloadImages_]: download images: kNTMmr
+#   [StartupImageManager::downloadImages_]: download finished: kNTMmr
+#   [StartupImageManager::_GetBackgroundImageInfoList] need show: kNTMmr
+#   [StartupImageManager::sendEventStartupImageUpdate_] send campagin size: 1
+#   sendClickEvent: name=ShowLaunchingCampaign
+#
+# ---------------------------------------------------------------------------
+# Which function actually draws the ad
+# ---------------------------------------------------------------------------
+#
+# There are two `StartupBkWidget` entry points with confusingly similar names,
+# and only one of them draws the ad:
+#
+#   updateCarouselBkImages    0x2a79b0   <-- the real display path
+#   continueCarouselBkImages  0x2a5400   <-- a decoy; patching it does nothing
+#
+# `continueCarouselBkImages` is only reachable from `ShellWindow::
+# gotoStartingPage` (which hides the splash) and from Qt connection tables.  It
+# is **never called while the ad is displayed** -- the run above contains zero
+# occurrences of either of its two log lines:
+#
+#   [StartupBkWidget::continueCarouselBkImages] display not allowed
+#   [StartupBkWidget::continueCarouselBkImages] continue carousel bk images
+#
+# so NOPing its `[this+0x89]` test has no visible effect.  That is why the ad
+# survives a patch aimed at `continueCarouselBkImages`.
+#
+# The live path is `updateCarouselBkImages`, reached as:
+#
+#   ShellWindow::updateStartupImage  (0x2a1ac0)
+#     -> thunk 0x8cba -> updateCarouselBkImages (0x2a79b0)
+#
+# ---------------------------------------------------------------------------
+# The decision to make
+# ---------------------------------------------------------------------------
+#
+# Its first action is to bail out when there are no campaign images:
+#
+#   0x2a79ec  call QListData::isEmpty        ; the candidate image list
+#   0x2a79f2  test al, al
+#   0x2a79f4  jnz  loc_1402A7BDD             ; <-- forced below
+#   0x2a79fa  ...                            ; non-empty: measure and paint
+#
+# and `loc_1402A7BDD` is the author's own "nothing to show" tail:
+#
+#   *(_QWORD *)(a1+80) = QListData::shared_null   ; drop the image list
+#   sub_14001DABB(a1, 1)
+#   sub_1400072BB(a1)                             ; fall back to the default art
+#   log "[StartupBkWidget::updateCarouselBkImages]: image info is empty"
+#
+# Turning the 6-byte `jnz rel32` into an unconditional `jmp rel32` plus one NOP
+# therefore makes every call take that path: the downloaded campaign is
+# discarded before it is ever measured or painted, and the built-in default
+# splash still renders.  No new control flow is invented, the flag itself is
+# untouched, and the length is preserved so nothing relocates.
+#
+# The built-in static splash frames under
+# resources/images/nx/device/jpeg/img_startup_*.jpeg are separate and are left
+# alone -- `mumu-patch splash` is the tool for those.
+#
+# Note the campaign is still *downloaded* (the fetch happens in
+# `StartupImageManager`, before this widget is involved).  Suppressing the
+# download as well would mean patching `fetchImageInfos_`, which is a larger
+# change; the image simply never reaches the screen.
+[[patch]]
+id = "splash-carousel"
+description = "Stop the startup splash from painting downloaded campaign ad images"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "opacity_", window = 0x400 }
+signature = "FF 15 ?? ?? ?? ?? 84 C0 ?? ?? ?? ?? ?? ?? 48 8B CE"
+expect = "FF 15 EE A5 F4 01 84 C0 0F 85 E3 01 00 00 48 8B CE"
+replace = "FF 15 EE A5 F4 01 84 C0 E9 E4 01 00 00 90 48 8B CE"
+known_rvas = ["0x2a79ec"]
+
+
+# ===========================================================================
+# Startup campaign download
+# ===========================================================================
+#
+# `splash-carousel` above stops the downloaded campaign image from being
+# *painted*.  It does not stop the download: every launch still calls
+#
+#   https://api.mumu.nie.netease.com/api/v2/campaign/launcher/launching
+#
+# and writes the result under
+# `%APPDATA%\Netease\MuMuPlayer\data\startupImage\<campaignId>\`
+# (Normal.jpeg / Hover.jpeg / Pressed.jpeg + imageManager.json).  This patch
+# removes the request itself.
+#
+# ---------------------------------------------------------------------------
+# The call chain
+# ---------------------------------------------------------------------------
+#
+#   QMetaObject::invokeMethodImpl  (queued, from the startup presenter)
+#     -> lambda 0x140e094f0 -> 0x140b93930
+#       -> fetch initiator 0x141023750   <-- patched here
+#         -> HTTP GET, then sub_14101fe70 parses the JSON
+#           -> sub_1410256a0 downloadImages_ fetches the three JPEGs
+#
+# `0x141023750` builds the URL by appending `v2/campaign/launcher/launching` to
+# the configured API host, logs
+# `[StartupImageManager::fetchImageInfos_]: url: %s`, and only then issues the
+# request.  It is the single entry point for the whole campaign fetch, so
+# stopping it here stops the request, the parse, the three image downloads and
+# the `imageManager.json` rewrite together.
+#
+# ---------------------------------------------------------------------------
+# The patch
+# ---------------------------------------------------------------------------
+#
+# The function already begins with a guard that returns when its context object
+# is absent:
+#
+#   0x102379a  cmp  [rcx+0F0h], r14     ; r14 = 0
+#   0x10237a1  jz   loc_141024C62       ; <-- forced below
+#   0x10237a7  xorps xmm0, xmm0         ; build the request...
+#
+# and `loc_141024C62` is the plain epilogue: it runs the stack-cookie check,
+# restores the saved registers and returns.  Nothing has been allocated yet at
+# this point, so the early return cannot leak -- and it is the same exit the
+# function already takes for every other failure path.
+#
+# Turning the 6-byte `jz rel32` into an unconditional `jmp rel32` plus one NOP
+# therefore makes the fetch a no-op on every launch.  The jump target is
+# unchanged (`0x1024c62`), and the length is preserved so nothing relocates.
+#
+# Effect: no request to the campaign API, no new files under `data/startupImage`.
+# The splash still shows the bundled default art, which `mumu-patch splash`
+# controls.
+#
+# Note this is deliberately a *separate* patch from `splash-carousel` so the two
+# can be applied independently: `splash-carousel` alone keeps the download but
+# never shows it, while both together leave no trace at all.
+[[patch]]
+id = "splash-ad-download"
+description = "Stop the startup splash from downloading campaign ad images"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "X-Param-MUMU-TOKEN", window = 0x800 }
+signature = "4C 39 B1 F0 00 00 00 ?? ?? ?? ?? ?? ?? ?? ?? ??"
+expect = "4C 39 B1 F0 00 00 00 0F 84 BB 14 00 00 0F 57 C0"
+replace = "4C 39 B1 F0 00 00 00 E9 BC 14 00 00 90 0F 57 C0"
+known_rvas = ["0x102379a"]
+
+
+# ===========================================================================
+# Startup logo
+# ===========================================================================
+#
+# The boot splash draws the MuMu logo in the middle of the progress screen.
+# That visibility is a real feature flag -- `feature.startup_middle_logo.enabled`
+# (id 51) -- but the vendor shipped the check in a form the config engine cannot
+# reach at this site, so the reliable route is the same conditional the author
+# already wrote:
+#
+#   mov  edx, 33h                     ; feature id 51 = StartupMiddleLogo
+#   call Controller_IsFeatureEnabled  ; 0x140011e96
+#   test al, al
+#   jz   loc_1402A1F61                ; 0x2a1e29: not enabled -> skip the logo
+#
+# `Controller_IsFeatureEnabled` returns TRUE when the feature is enabled and the
+# caller *builds* the UI, so the logo is drawn on the fall-through path.  Turning
+# the 6-byte `jz rel32` into an unconditional `jmp rel32` (plus one NOP to keep
+# the length) therefore always takes the author's own "do not show" branch.
+#
+# Why patch the branch instead of forcing the return value
+# -------------------------------------------------------
+# Writing `feature.startup_middle_logo.enabled` = `true` in features.json would
+# flip this flag, but that file does not exist on a stock install and creating it
+# enables *every other* device feature as a side effect (an absent file already
+# means "all on"; see doc/analysis/config-and-features.md).  The branch is local,
+# explicit, and leaves the rest of the flag system alone.
+#
+# The jump target is 0x2a1f61, inside the same function, and is the address both
+# of the function's other early-outs use -- so it is a path the binary already
+# takes, not a new one.  Length is preserved (6 bytes -> 5-byte jmp + 1 NOP), so
+# nothing relocates and no other instruction shifts.
+[[patch]]
+id = "splash-logo"
+description = "Hide the MuMu logo drawn on the startup splash"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "/startup.jpeg", window = 0x400 }
+signature = "BA 33 00 00 00 E8 ?? ?? ?? ?? 84 C0 ?? ?? ?? ?? ?? ?? 48 8B 8E"
+expect = "BA 33 00 00 00 E8 6F 00 D7 FF 84 C0 0F 84 32 01 00 00 48 8B 8E"
+replace = "BA 33 00 00 00 E8 6F 00 D7 FF 84 C0 E9 33 01 00 00 90 48 8B 8E"
+known_rvas = ["0x2a1e1d"]
+
+
+# ===========================================================================
+# Side-panel menu entries
+# ===========================================================================
+#
+# The slide-out menu is built like the launcher's dropdown: one block per item,
+# each block keyed by a `mainMenu*MenuItem` identifier.  Fifteen of them exist:
+#
+#   mainMenuAndroidMenuItem        安卓导航键
+#   mainMenuWindowManagerMenuItem  窗口管理
+#   mainMenuKeymapMenuItem         键鼠/手柄
+#   mainMenuOperationRecorderMenuItem 操作录制
+#   mainMenuSynchronizerMenuItem   同步器
+#   mainMenuMumuRemoteMenuItem     远程控制   <-- removed
+#   mainMenuGameAccelerationMenuItem 加速服务  <-- removed
+#   mainMenuGpsMenuItem            虚拟定位
+#   mainMenuMultiPlayerMenuItem    多开
+#   mainMenuGameToolsMenuItem      游戏中心
+#   mainMenuMoreToolsMenuItem      更多工具
+#   mainMenuDeviceSettingMenuItem  设备设置
+#   mainMenuHelpCenterMenuItem     帮助中心
+#   mainMenuRebootDeviceMenuItem   重启设备
+#   mainMenuToolbarVisibilityMenuItem
+#
+# Every block has the same shape, and crucially every block is guarded by the
+# same construct:
+#
+#   lea  rcx, [rbp+X]        ; the item's data
+#   call <predicate>         ; returns bool in al
+#   test al, al
+#   je   <skip>              ; when false, the item is not added at all
+#   ...build the item...
+#
+# In this build the predicate is a stub -- `mov al,1; ret` -- because the
+# feature-flag checks were compiled out into a bank of 62 identical stubs at
+# 0x155180, 0x155190, 0x1551a0, ... (16 bytes apart).  Each stub is called
+# from exactly one place, so the stub's meaning is entirely given by its
+# caller:
+#
+#   0x155180  called only from 0x254fa5  in the 远程控制 block
+#   0x155330  called only from 0x25556f  in the 加速服务 block
+#
+# Patching the *call site* rather than the stub
+# ---------------------------------------------
+# It is tempting to rewrite a stub as `xor al,al; ret` (b0 01 c3 -> 32 c0 c3),
+# but the stubs are byte-identical and separated only by their address, so a
+# signature cannot confirm which one is being edited -- and an address alone
+# would silently keep working if the bank were ever reshuffled.
+#
+# Instead the call itself is replaced, in place, with an explicit `xor al,al`
+# plus three NOPs:
+#
+#   E8 <rel32>          call <stub>
+#   32 C0 90 90 90      xor al,al ; nop ; nop ; nop
+#
+# `al` is defined by the replacement rather than left stale, so the following
+# `test al,al` / `je` reliably takes the skip branch and the item is never
+# added.  Same five bytes, so nothing relocates.  And because the surrounding
+# instructions (the `lea rcx,[rbp+..]` before and the `test`/`je` after) are
+# part of the signature, the patch verifies itself against the right block.
+#
+# 远程控制 and 加速服务 are the two entries the user selected.  Everything else
+# in the list above is deliberately left alone.
+#
+# The two entries are NOT guarded the same way; the note above each patch states
+# which lever applies to which, because using the wrong one silently removes the
+# wrong number of entries.
+
+# -- 远程控制 (Remote control) ----------------------------------------------
+#
+# 远程控制 has **no** feature guard around its construction.  The only call in
+# its block is the stub at 0x254fa5, and that stub's `je` lands at 0x254fd1 --
+# *before* the item factory at 0x254fe2 -- so it only decides whether an
+# optional click handler is installed.  The item itself is built
+# unconditionally, which is why no `features.json` setting can remove it.
+#
+# The block runs from 0x254f9e (the stub's argument setup) to 0x25501b, where
+# the *next* item's guard begins.  Jumping there skips exactly this one item.
+#
+#   E9 <rel32>          jmp 0x25501b
+#   90 x 11             padding to keep the 16-byte length
+#
+# 0x25501b is the `mov rcx,[r14+458h]` that opens the 加速服务 guard, so this
+# patch does not touch 加速服务, 虚拟定位 or anything below it.
+[[patch]]
+id = "menu-remote-control"
+description = "Remove the 远程控制 entry from the device side-panel menu"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "mainMenuMumuRemoteMenuItem", window = 0x100 }
+signature = "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 48 8D 05 63 F2 83 01 48 89 85 C0 21"
+expect = "48 8D 8D A0 07 00 00 E8 D6 01 F0 FF 84 C0 74 23 48 8D 05 63 F2 83 01 48 89 85 C0 21"
+replace = "E9 78 00 00 00 90 90 90 90 90 90 90 90 90 90 90 48 8D 05 63 F2 83 01 48 89 85 C0 21"
+known_rvas = ["0x254f9e"]
+
+# -- 加速服务 (Acceleration service) ----------------------------------------
+#
+# 加速服务 *is* feature-gated, and the gate is live:
+#
+#   0x25501b  mov  rcx, [r14+458h]
+#   0x255025  je   0x2555f1            ; no handler object -> skip
+#   0x25502b  mov  edx, 2bh            ; feature id 43 = UU
+#   0x255030  call Controller_IsFeatureEnabled
+#   0x255037  je   0x2555f1            ; <-- forced below
+#
+# The item is built on the fall-through path.  Turning the 6-byte `je rel32`
+# into an unconditional `jmp rel32` plus one NOP always takes the author's own
+# skip, so the entry disappears regardless of what `features.json` says.
+#
+# This is deliberately *not* a block-skip like the patch above: jumping from
+# 0x255568 to 0x255a21 would sail past 虚拟定位's guard as well and remove two
+# entries instead of one.  Patching the branch inside this item's own guard
+# cannot reach the next item.
+#
+# Length is preserved (6 bytes -> 5-byte jmp + 1 NOP), so nothing relocates.
+[[patch]]
+id = "menu-acceleration"
+description = "Remove the 加速服务 entry from the device side-panel menu"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "mainMenuMumuRemoteMenuItem", window = 0x200 }
+signature = "BA 2B 00 00 00 E8 ?? ?? ?? ?? 84 C0 ?? ?? ?? ?? ?? ??"
+expect = "BA 2B 00 00 00 E8 61 CE DB FF 84 C0 0F 84 B4 05 00 00"
+replace = "BA 2B 00 00 00 E8 61 CE DB FF 84 C0 E9 B5 05 00 00 90"
+known_rvas = ["0x25502b"]
+
+# -- 动态栏 (Dynamic Tab) ----------------------------------------------------
+#
+# 动态栏 is feature-gated: the guard tests id 44 (0x2c).  Note that id 44 does
+# *not* line up with the `feature.uu_remote.enabled` key of the same ordinal in
+# the key table -- the name list and the key list are two independent lists and
+# are known not to be index-aligned (see doc/analysis/config-and-features.md).  The
+# branch below is therefore trusted over any table lookup.
+#
+# The item is built inline in the device main-menu builder `sub_1402514A0`,
+# which is the function that emits every entry the user sees in the side panel.
+# Its guard is the same shape as 加速服务's:
+#
+#   0x255e66  mov  rcx, [r14+458h]
+#   0x255e6d  test rcx, rcx
+#   0x255e70  jz   0x25629b            ; no handler object -> skip
+#   0x255e76  mov  edx, 2ch            ; feature id 44
+#   0x255e7b  call Controller_IsFeatureEnabled
+#   0x255e80  test al, al
+#   0x255e82  jz   0x25629b            ; <-- forced below
+#
+# `0x25629b` is the author's own "this item is not enabled" landing pad: it is
+# exactly where the *first* `jz` above already goes, and where execution
+# resumes for the next entry (更多工具, id 38, whose guard opens at 0x2562b3).
+# Turning the 6-byte `jz rel32` into an unconditional `jmp rel32` plus one NOP
+# therefore takes a path the vendor already wrote and already exercises, and
+# skips exactly this one item -- nothing below it is affected.
+#
+# The skipped range 0x255e88..0x256296 only ever builds and destroys stack-local
+# QStrings (`var_1CE0`, `var_1CD8`, ...) around the item factory call
+# `sub_140003238` / `sub_140028254`.  Jumping over the whole range means those
+# locals are never constructed, so there is nothing to unwind and no leak --
+# the block's own destructors are skipped along with its constructors.
+#
+# ---------------------------------------------------------------------------
+# Why this must NOT be done with the id-13 patch
+# ---------------------------------------------------------------------------
+#
+# Do not remove 动态栏 by making the *provider predicate* `sub_1402CBD30` report
+# that object id 13 is absent (`sub_140023830(a1, 13)`).  That id belongs to the
+# 游戏中心 *titlebar* button, not to this menu entry, and the titlebar builder
+# `sub_1402076A0` does
+#
+#   mov  edx, 0Dh ; call getObjectById ; mov rcx, rax ; call sub_14002784F
+#
+# with **no null check** (`sub_1402D4C30` returns nullptr when it finds
+# nothing), so removing id 13 produces an immediate 0xC0000005 at
+# base+0x2c6140 reading `[rcx+40h]` with rcx=0.  That patch must not be
+# reintroduced -- see `tests/test_profiles.py`.
+#
+# This patch is a different mechanism on a different object: it forces a branch
+# the binary already contains, and it never makes a lookup fail.  The menu item
+# is not reachable by id lookup from the titlebar path, so nothing downstream
+# can observe its absence.
+#
+# Length is preserved (6 bytes -> 5-byte jmp + 1 NOP), so nothing relocates.
+[[patch]]
+id = "menu-dynamics-tab"
+description = "Remove the 动态栏 entry from the device side-panel menu"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "mainMenuMultiPlayerMenuItem", window = 0x200 }
+signature = "BA 2C 00 00 00 E8 ?? ?? ?? ?? 84 C0 ?? ?? ?? ?? ?? ??"
+expect = "BA 2C 00 00 00 E8 16 C0 DB FF 84 C0 0F 84 13 04 00 00"
+replace = "BA 2C 00 00 00 E8 16 C0 DB FF 84 C0 E9 14 04 00 00 90"
+known_rvas = ["0x255e76"]
+
+
+# ===========================================================================
+# Game tools panel: auto-popup and config fetch
+# ===========================================================================
+#
+# Two independent levers, both server-driven:
+#
+#   gametools-no-autopopup     stops the unprompted popup on game launch
+#   gametools-no-config-fetch  stops the api/sidebar request and its cache
+#
+# ---------------------------------------------------------------------------
+# Do not add: a gametools-dynamics-tab patch (crashes on startup)
+# ---------------------------------------------------------------------------
+#
+# Removing the 动态栏 *tab* by NOPing the availability branch in the factory at
+# 0x2cbd47 must not be attempted:
+#
+#   0x2cbd47  mov  edx, 0Dh            ; id 13
+#   0x2cbd4c  call sub_140023830      ; available?
+#   0x2cbd53  jnz  loc_1402CBD6A      ; <- do not NOP
+#
+# **This crashes the process on startup.**  The captured minidump shows:
+#
+#   exception  0xC0000005 (access violation), Rip = module base + 0x2c6140
+#   Rcx        = 0x0
+#   0x2c6140   mov rax,[rcx+40h]      ; read [0+0x40]
+#
+# The chain is:
+#
+#   sub_1402076A0  (title-bar / toolbar builder)
+#     0x140207f24  mov  edx, 0Dh        ; id 13
+#     0x140207f2c  call sub_14003715F   ; getObjectById -> sub_1402D4C30
+#     0x140207f31  mov  rcx, rax        ; rax = 0 once id 13 is gone
+#     0x140207f34  call sub_14002784F   ; -> 0x2c6140, dereferences rcx
+#
+# `sub_1402D4C30` walks a list and returns `nullptr` when the id is absent, and
+# that caller has **no null check**.  So id 13 is not a panel tab at all: it is
+# the 游戏中心 toolbar button, and removing it guarantees a null dereference
+# during startup.
+#
+# The real 动态栏 tab is built inline inside the panel builder
+# (`sub_1405CD3B0`, via the `Dynamics Tab` string at 0x1405cd84c) and has no
+# reusable availability gate, so there is no safe single-branch patch for it.
+# It is reachable only by opening the panel, and `gametools-no-autopopup` stops
+# it appearing on its own.
+#
+# If a future build genuinely needs the tab gone, the correct approach is to
+# find where the tab bar adds the widget (around 0x1405cd81b) and skip that
+# `addWidget` call -- not to make the button lookup fail.
+#
+# The 动态栏 *menu* entry is a separate object and is removed safely by the
+# `menu-dynamics-tab` patch above, which forces that entry's own feature gate.
+#
+# ---------------------------------------------------------------------------
+# the automatic popup on game launch
+# ---------------------------------------------------------------------------
+#
+# When a game starts, the shell is told to display the game tools panel through
+# the `GameToolsDisplay` signal.  The handler is `sub_14059EC10`:
+#
+#   0x59ec5e  call sub_140019097       ; SubShellWindow::showGameTools(...)
+#   0x59ec63  test al, al
+#   0x59ec65  jz   loc_14059ED92       ; <-- forced below
+#   0x59ec6b  ...                      ; build and show the panel
+#
+# and `loc_14059ED92` is the plain epilogue (restore, return).  Forcing the
+# branch means the signal is acknowledged but the window is never built, so no
+# panel appears when a game launches.
+#
+# This is the *automatic* path only.  The manual route -- clicking the 游戏中心
+# toolbar button -- goes through `ShellWindow::triggerGameTools`
+# (`sub_140284480`) instead, which does not reach this function, so the button
+# keeps working.  If the panel should be unreachable by any route, patch
+# `SubShellWindow::showGameTools` (`sub_14059EE70`) as well.
+#
+# Length is preserved: the 6-byte `jz` becomes a 5-byte `jmp` plus one NOP.
+[[patch]]
+id = "gametools-no-autopopup"
+description = "Stop the game tools panel from popping up automatically on game launch"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "[SubShellWindow::showGameTools]: show game tools, url: %1, tabIds: %2, width: %3, isNoMoreRemindBtnDisplay: %4", window = 0x800 }
+signature = "E8 ?? ?? ?? ?? 84 C0 ?? ?? ?? ?? ?? ?? 49 8B"
+expect = "E8 34 A4 A7 FF 84 C0 0F 84 27 01 00 00 49 8B"
+replace = "E8 34 A4 A7 FF 84 C0 E9 28 01 00 00 90 49 8B"
+known_rvas = ["0x59ec5e"]
+
+# ---------------------------------------------------------------------------
+# the automatic per-game config download
+# ---------------------------------------------------------------------------
+#
+# The panel's contents are driven by a server config fetched per game:
+#
+#   [GameToolsManager::getRequestParam_]: url: https://api.mumu.nie.netease.com/api/sidebar
+#
+# The request is issued by `sub_14102A160`, and the only caller is
+# `GameToolsPresenter::fetchGameToolsConfig` (`sub_140BCBFF0`), which already
+# begins with a "do not fetch" early-out:
+#
+#   0xbcbff0  test r9b, r9b            ; the caller's "should fetch" flag
+#   0xbcbff3  jz   loc_140BCC0D1       ; <-- forced below
+#   0xbcbff9  push rbx ...             ; build and send the request
+#
+# `loc_140BCC0D1` is a bare `ret` -- it is reached before any register is
+# pushed, so returning there is stack-safe.  Forcing the branch makes the fetch
+# a no-op: no request to `api/sidebar`, and nothing written under
+# `%APPDATA%\Netease\MuMuPlayer\data\GameToolsData\`.
+#
+# Consequence worth knowing: the manual panel also loses its server-driven
+# tabs, because it reads the same config.  That is the point -- the config is
+# what decides *which* games get which tabs and popups -- but it means the
+# panel is empty rather than populated-but-hidden if it is ever opened.
+[[patch]]
+id = "gametools-no-config-fetch"
+description = "Stop the automatic per-game game-tools config download (api/sidebar)"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+locate = { kind = "string-ref", value = "[GameToolsPresenter::fetchGameToolsConfig]: %1 has none game tools config fetched", window = 0x800 }
+signature = "45 84 C9 ?? ?? ?? ?? ?? ?? 53 56 57"
+expect = "45 84 C9 0F 84 D8 00 00 00 53 56 57"
+replace = "45 84 C9 E9 D9 00 00 00 90 53 56 57"
+known_rvas = ["0xbcbff0"]

@@ -1,0 +1,247 @@
+# Disarms MuMuNxDevice.exe's self-integrity check, which punishes a patched
+# binary by burning CPU forever.
+#
+# Why this profile must accompany every other MuMuNxDevice.exe profile
+# -------------------------------------------------------------------
+# The CLI strips the Authenticode blob from a binary whenever it patches it
+# (see `pe.strip_signature`), and MuMuNxDevice.exe reacts to that the same way
+# MuMuNxMain.exe does: it verifies its own Authenticode signature at startup and
+# treats "unsigned" as tampering.  The punishment is not a message box.  It
+# spawns eleven detached threads that each loop forever over a synthetic
+# floating-point workload, so one whole core is pegged for the life of the
+# process.
+#
+# So `device-ui` *arms* this trap simply by existing.  Apply this profile with
+# it -- `device-ui` declares the dependency, so it cannot be forgotten.
+#
+# This is a separate trap from the MuMuNxMain.exe one in `no-integrity-punish`.
+# The two binaries are the same Qt/PE family and the check has the same shape,
+# but the addresses are unrelated and neither patch works in the other binary.
+#
+# How this was found
+# ------------------
+# The trigger was caught live, not inferred.  `device-ui` had been applied to a
+# MuMuNxDevice.exe whose signature was stripped, and the process showed the
+# signature of this specific punishment:
+#
+#   * MuMuNxDevice.exe (pid 21072): 8051 s of CPU, 339 threads, on a 32-core
+#     host, against ~8 s for MuMuNxMain.exe and <1 s for the service processes.
+#   * Exactly eleven threads, each with ~617 s of *user-mode* CPU and ~0 s of
+#     kernel time -- 100% of one core between them, and nothing like a normal
+#     thread pool.
+#   * A RIP sample of the hottest threads landed repeatedly inside the sqrt loop
+#     at RVA 0x8ddf21 / 0x8ddf35 / 0x8ddf3b / 0x8ddf41, with the remaining
+#     samples in ntdll's wait path -- i.e. "compute for a while, sleep, repeat".
+#
+# The check
+# ---------
+# sub_1408DEF90, queued from startup on a detached thread:
+#
+#     QCoreApplication::applicationFilePath(v9);
+#     if ( !sub_14002B3FA(*a1, v9) || !sub_14003644E(*a1, v9) )
+#     {
+#         ... decode obfuscated base64 strings, log them ...
+#         sub_14001EB2D();   // <-- RandomLagPunisher: the 11 CPU burners
+#         sub_140037CC7();   // <-- RandomInputLossPunisher
+#         sub_140012396();   // <-- RandomMouseOffsetPunisher
+#         sub_140027D72();
+#         sub_140010A91();
+#         ...
+#     }
+#     QString::~QString(v9);
+#
+# The RTTI type descriptors in the image name the three punishers directly
+# (`.?AVRandomLagPunisher@@`, `.?AVRandomInputLossPunisher@@`,
+# `.?AVRandomMouseOffsetPunisher@@`), which is what identifies this as a
+# deliberate punishment rather than a runaway loop.
+#
+# The two predicates are the two halves of the check, exactly as in
+# MuMuNxMain.exe:
+#
+#   sub_14002B3FA -> sub_1408E2B60
+#       WinVerifyTrust(nullptr, &WINTRUST_ACTION_GENERIC_VERIFY_V2, ...)
+#       returns `result != 0x800B0100` -- i.e. TRUE unless the file is
+#       *unsigned*.  A stripped binary is unsigned, so this returns FALSE.
+#
+#   sub_14003644E -> sub_1408E2C60
+#       compares the file's Authenticode *signer name* against a constant.
+#       sub_140034086 -> sub_1408E18D0 opens the embedded PKCS#7 with
+#       CryptQueryObject, reads CMSG_SIGNER_INFO_PARAM, finds the signer
+#       certificate with CertFindCertificateInStore(CERT_FIND_SUBJECT_CERT) and
+#       returns CertGetNameStringW(CERT_NAME_SIMPLE_DISPLAY_TYPE) -- the
+#       publisher's display name.  sub_1408E2C60 compares that against an
+#       obfuscated constant.
+#
+#       This is a *publisher pin*, not a digest: it asks "is this signed by the
+#       expected vendor?", not "is every byte unchanged?".  The two predicates
+#       are complementary -- A catches tampering, B catches re-signing with a
+#       different certificate.
+#
+# Because the condition is `!A || !B`, a stripped (hence patched) binary fails
+# on the first term alone.  Not stripping the signature does not help either:
+# the signature then no longer matches the bytes, WinVerifyTrust returns
+# TRUST_E_BAD_DIGEST (which is not TRUST_E_NOSIGNATURE, so A becomes TRUE) and
+# the second term still fails.  The check has to be disarmed, not satisfied.
+#
+# The CPU burner
+# --------------
+# sub_14001EB2D -> sub_1408E1380 spawns a detached thread running
+# sub_1408DC9A0 -> sub_1408DED60, whose `++v2 >= 11` bound is the source of the
+# eleven threads.  It joins them, and the join never returns because each of
+# them runs sub_1408DDEF0, an unconditional infinite loop:
+#
+#     while (1) {
+#         v3 = 0.0;
+#         for (i = 0; i < 10000000; ++i)   // 10 million sqrts
+#             v3 += sqrt((double)i);
+#         sub_14002B724(...);              // Sleep
+#     }
+#
+# The burn is duty-cycled, not continuous: the loop spends most of its wall time
+# in that sleep, so each thread sits near 10% of a core and the eleven together
+# come to roughly one core.  Measured live: 11 threads x ~9-10%, 1.00 core in
+# total, all of it user-mode with ~0 s of kernel time.
+#
+# The other three punishments
+# ---------------------------
+# The CPU burn is only the first of four things the punishment block starts.
+# The others are installed as Qt native event filters and are *probabilistic
+# per event* -- which is what the `Random` in their names means.  Each draws
+# from an mt19937 seeded by std::_Random_device and gates on `100 * rand()`,
+# re-drawing until the value clears 0x60, so a given input event is only
+# corrupted some of the time:
+#
+#   sub_140037CC7 -> sub_1408DC9E0 installs RandomLagPunisher
+#       eventFilter = sub_1408E40A0.  Randomly stalls the event loop, which is
+#       what makes the whole UI feel slow on top of the CPU burn.
+#
+#   sub_140012396 -> sub_1408DC820 installs RandomInputLossPunisher
+#       eventFilter = sub_1408E3F30.  Acts only on `windows_generic_MSG` /
+#       `windows_dispatcher_MSG`, and only for keyboard messages
+#       (WM_KEYDOWN 0x100 .. WM_SYSCHAR 0x106, via sub_1408E2ED0) or mouse
+#       messages (WM_MOUSEMOVE 0x200 .. WM_MOUSEHWHEEL 0x20E, via
+#       sub_1408E2F90) -- i.e. it randomly *swallows input*.
+#
+#   sub_140027D72 -> sub_1408DC900 installs RandomMouseOffsetPunisher
+#       eventFilter = sub_1408E4340.  Randomly shifts mouse coordinates, logging
+#       ") to (" and ") for msg=" as it rewrites them.
+#
+# So a tampered build does not merely burn a core: it also drops keystrokes and
+# clicks and moves the pointer, which is what makes it feel like the emulator is
+# broken rather than merely busy.
+#
+# It also phones home
+# -------------------
+# The last call in the punishment block, sub_140010A91 -> sub_140F7C7F0, queues
+# sub_140F7B950 on the event loop.  That function reports a statistics event
+# named **MainProgramCrackDetection** through the NemuStatistics service, with
+# `module_name = "mainProgram"`.  It is rate-limited by a QSettings key
+# (`68440176-0FBD-45E7-83E8-7B7EC175861C`, holding a QDate): the report is sent
+# at most once per day, then the date is written back and synced.
+#
+# Its sibling sub_1410F4F90 reports **MainProgramAuthVerify** with
+# status_code / error_code / failure_reason / error_msg.  So "this build was
+# tampered with" is not a silent local decision -- it is telemetered, and the
+# rate limit means a first run can look quiet while a later one reports.
+#
+# This profile disarms the punishment; it does not silence the reporting.  A
+# user who wants that too should pair this with the telemetry work in
+# `no-telemetry.toml` (which currently targets MuMuNxMain.exe only).
+#
+# The lever
+# ---------
+# The condition `!A || !B` compiles to TWO branches, and both have to be
+# defused -- patching only one leaves the other free to enter the punishment
+# block.  sub_1408DEF90's decision, in full:
+#
+#   1408defc3  call sub_14002B3FA      ; A: WinVerifyTrust check -> al
+#   1408defc8  test al, al
+#   1408defca  jz   loc_1408DEFE0      ; <-- guard 1: if !A -> punish
+#   1408defcc  lea  rdx, [rbp+var_50]
+#   1408defd0  mov  rcx, [rbx]
+#   1408defd3  call sub_14003644E      ; B: signer-name check -> al
+#   1408defd8  test al, al
+#   1408defda  jnz  loc_1408DF290      ; <-- guard 2: if B -> clean exit
+#   1408defe0  loc_1408DEFE0:          ; the punishment block
+#   ...
+#   1408df290  loc_1408DF290:          ; the clean epilogue:
+#   1408df290  lea  rcx, [rbp+var_50]  ;   ~QString, __security_check_cookie,
+#   1408df294  call QString::~QString  ;   restore rbx, add rsp, pop rbp, retn
+#
+# The patch covers both branches in one 22-byte window:
+#
+#   guard 1  74 14                  -> 90 90                 (never punish)
+#   guard 2  0F 85 B0 02 00 00      -> E9 B1 02 00 00 90     (always exit)
+#
+# With guard 1 removed the code always falls through to B, and with guard 2
+# unconditional it then always leaves for `loc_1408DF290` -- so the punishment
+# block becomes unreachable no matter what A and B return.  Control flows
+# straight down to the function's own epilogue; no block is jumped over, so the
+# MSVC exception state is never bypassed either.
+#
+# `loc_1408DF290` is the path the vendor takes on every legitimate run, so this
+# reuses an edge the binary already contains.  The two jumps are the same length
+# as what they replace (2 -> 2, and 6 -> 5 + 1 NOP), so nothing relocates.
+# Guard 2's displacement shifts by one (0x2B0 -> 0x2B1) only because `jmp` is a
+# byte shorter than `jnz`; both resolve to 0x1408DF290.
+#
+# Why the locator is an import call
+# ---------------------------------
+# The check function opens by calling
+# `QCoreApplication::applicationFilePath`, and the patched window begins 0x15
+# bytes later.  Unlike MuMuNxMain.exe's equivalent -- whose predicate resolves
+# `WinVerifyTrust` through a pointer loaded at run time, so the symbol is in no
+# import table -- this anchor is a plain import call, which makes the site
+# locatable from a fact that survives a rebuild.
+#
+# `applicationFilePath` is called from seven places in the image, so the anchor
+# alone does not discriminate; the signature does.  All seven are checked and
+# exactly one has this window within 0x40 bytes, which is why the window is
+# narrow: widening it would not add candidates, but a tight window is what keeps
+# the guarantee legible.  Verified on the pristine vendor build: the locator
+# resolves to 0x8defca, the RVA recorded below.
+#
+# The signature wildcards the two guards, because the patch rewrites exactly
+# those bytes -- pinning them would stop the signature matching the moment the
+# patch was applied, and `verify` would report it lost.  The `call` displacement
+# in the middle is deliberately *kept literal*: it is context the patch never
+# touches, and wildcarding it as well makes the pattern match a second site at
+# RVA 0x8defba (a nearby `lea`/`call`/`test` sequence), which `scan_unique`
+# would then refuse as ambiguous.  Keeping it pinned is safe because the locator,
+# not the signature, is what finds the site; the signature only verifies it.
+#
+# What this does not change
+# -------------------------
+# Only the two branches are patched.  The check still runs, still calls
+# WinVerifyTrust and still reads the signer name; it just no longer acts on a
+# negative result.  Nothing else in the startup path is touched.
+
+[profile]
+name = "no-device-integrity-punish"
+description = "Stop MuMuNxDevice.exe's self-integrity check from spawning CPU-burning threads (required with any other MuMuNxDevice.exe patch)"
+# This is a base of the dependency graph for the device binary: every other
+# profile that touches MuMuNxDevice.exe requires *this* one, so it must require
+# nothing itself.  It is the device-side counterpart of `no-integrity-punish`,
+# which plays the same role for MuMuNxMain.exe.
+requires = []
+# The vendor build these offsets were authored against (see pe/buildid.py).
+# Purely diagnostic: if the installed MuMuNxDevice.exe hashes differently, the
+# tool says so plainly instead of reporting a pile of signature failures.  It
+# never blocks a patch -- the per-patch signature and `expect` checks are the
+# real gate.  Regenerate after a MuMu update with `mumu-patch rebase`.
+build = "bd76ae0490f2acfd"
+
+[[patch]]
+id = "device-integrity-check-clean-exit"
+description = "Make the self-integrity check take its own pass path instead of the punishment block"
+file = "nx_device/15.0/shell/MuMuNxDevice.exe"
+# Anchored on the `applicationFilePath` import call that opens the check, which
+# is a fact that survives a rebuild; the signature then verifies the site.
+locate = { kind = "import-call", value = "?applicationFilePath@QCoreApplication@@SA?AVQString@@XZ", window = 0x40 }
+# Offsets 0..1 are guard 1 and offsets 16..21 are guard 2 -- exactly the bytes
+# the patch rewrites, so both are wildcarded.  Everything between them, the
+# signer-name `call` included, is context the patch never touches.
+signature = "?? ?? 48 8D 55 B0 48 8B 0B E8 76 74 75 FF 84 C0 ?? ?? ?? ?? ?? ??"
+expect = "74 14 48 8D 55 B0 48 8B 0B E8 76 74 75 FF 84 C0 0F 85 B0 02 00 00"
+replace = "90 90 48 8D 55 B0 48 8B 0B E8 76 74 75 FF 84 C0 E9 B1 02 00 00 90"
+known_rvas = ["0x8defca"]

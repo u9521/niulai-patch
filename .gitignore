@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local backups of patched binaries
+backups/
+# Patch backups (contain full copies of the target binary).  Two directories
+# under here are the pristine vendor binaries tests/test_robustness.py reads.
+.backups/
+
+# Local scratch: unpacked APKs, dex dumps and interim builds while investigating.
+/.tmp/
+
+# The AOSP test keys under signing/ ARE tracked: they are public by design
+# (every AOSP build uses them), which is what makes same-key adb installs work.
+# The built launcher under src/prebuilts/ is tracked too -- it is the deliverable
+# that `mumu-patch lawnchair` installs, and it is verified by hash in code.

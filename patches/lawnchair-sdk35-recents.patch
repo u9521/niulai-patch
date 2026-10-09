@@ -1,0 +1,91 @@
+From: mumu-patch
+Subject: [PATCH] Task.java: drop the PersistedTaskSnapshotData reference for SDK 35
+
+The launcher is installed on Android 15 (SDK 35), where
+android.app.ActivityManager$RecentTaskInfo$PersistedTaskSnapshotData does not
+exist -- it is newer than this platform.  Two things in this file name it:
+
+  * the declared type of Task.lastSnapshotData;
+  * RecentTaskInfo.lastSnapshotData, a *platform* field of that type.
+
+Both make ART's class verifier reject the whole class:
+
+  java.lang.VerifyError: Verifier rejected class
+      com.android.systemui.shared.recents.model.Task:
+      void ...Task.<init>(Task) failed to verify:
+      [0x16] 'this' argument 'Reference java.lang.Object' not instance of
+      'Unresolved Reference:
+       android.app.ActivityManager$RecentTaskInfo$PersistedTaskSnapshotData'
+
+and because Task is built while loading the task list, the Recents screen
+crashes with it.
+
+Rewriting the *field declarations* to java.lang.Object is not enough, and
+neither is an SDK_INT guard: the verifier resolves every type a method
+mentions, so the reference has to be removed from the code.  This replaces it
+with a local stand-in of the same shape.  Nothing populates it, so
+getVisibleThumbnailRatio() reports 0f, which is the documented "snapshot data
+is not available" answer -- the data was never available on this platform
+anyway.
+
+Apply with:
+
+    git clone --depth 1 --branch v15.0.0-beta3.0 \
+        https://github.com/LawnchairLauncher/lawnchair.git
+    cd lawnchair
+    git apply /path/to/lawnchair-sdk35-recents.patch
+
+diff --git a/systemUI/shared/src/com/android/systemui/shared/recents/model/Task.java b/systemUI/shared/src/com/android/systemui/shared/recents/model/Task.java
+index f06e333..fe6fba4 100644
+--- a/systemUI/shared/src/com/android/systemui/shared/recents/model/Task.java
++++ b/systemUI/shared/src/com/android/systemui/shared/recents/model/Task.java
+@@ -242,9 +242,35 @@ public class Task {
+ 
+     public Rect appBounds;
+ 
+-    // Last snapshot data, only used for recent tasks
+-    public ActivityManager.RecentTaskInfo.PersistedTaskSnapshotData lastSnapshotData =
+-            new ActivityManager.RecentTaskInfo.PersistedTaskSnapshotData();
++    // Last snapshot data, only used for recent tasks.
++    //
++    // This was ActivityManager.RecentTaskInfo.PersistedTaskSnapshotData, a type
++    // that does not exist on Android 15 (SDK 35), which is what this launcher is
++    // installed on.  The class verifier resolves every type a method mentions,
++    // so an SDK_INT guard is not enough -- the reference itself has to go, or
++    // the whole Task class is rejected with
++    //   VerifyError: ... not instance of 'Unresolved Reference:
++    //   android.app.ActivityManager$RecentTaskInfo$PersistedTaskSnapshotData'
++    // and the Recents screen crashes.
++    //
++    // The stand-in keeps the shape the rest of the file uses.  Nothing ever
++    // fills it in, so getVisibleThumbnailRatio() returns 0f, which is the
++    // documented answer for "snapshot data is not available".
++    public SnapshotData lastSnapshotData = new SnapshotData();
++
++    /** Stand-in for the platform snapshot type, which this SDK does not have. */
++    public static final class SnapshotData {
++        public Point taskSize;
++        public Rect contentInsets;
++
++        public void set(SnapshotData other) {
++            if (other == null) {
++                return;
++            }
++            this.taskSize = other.taskSize;
++            this.contentInsets = other.contentInsets;
++        }
++    }
+ 
+     public Task() {
+         // Do nothing
+@@ -307,7 +333,9 @@ public class Task {
+     }
+ 
+     public void setLastSnapshotData(ActivityManager.RecentTaskInfo rawTask) {
+-        lastSnapshotData.set(rawTask.lastSnapshotData);
++        // RecentTaskInfo carries no snapshot data on this platform -- the field
++        // this used to read is part of the same missing type -- so there is
++        // nothing to copy.  Kept because callers exist.
+     }
+ 
+     public TaskKey getKey() {

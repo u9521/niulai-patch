@@ -1,0 +1,101 @@
+[project]
+name = "mumu-patch"
+description = "Reversible feature-stripping patcher for the installed Netease MuMu emulator"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "click>=8.5.0",
+  "pefile>=2024.8.26",
+  "rich>=15.0.0",
+]
+# `uv_build` does not support `dynamic = ["version"]`, so the version is
+# written here as well as in src/__about__.py.  `niulai-patch --version` reads
+# the module and the wheel metadata reads this line; tests/test_layout.py
+# asserts the two agree, which is what keeps the single-source promise honest.
+version = "0.1.0"
+
+[project.scripts]
+niulai-patch = "cli:main"
+
+[project.optional-dependencies]
+# Semantic patch-site locators (pe/locate.py) need a disassembler to resolve
+# rip-relative operands.  Optional on purpose: the tool still patches correctly
+# without it, and a patch that *asks* for a semantic locator fails closed with a
+# clear message rather than silently falling back to a weaker search.  capstone
+# ships abi3 wheels, so this needs no compiler.
+semantic = ["capstone>=5.0.9"]
+
+[dependency-groups]
+dev = [
+  "capstone>=5.0.9",
+  "pillow>=12.3.0",
+  "pytest>=9.1.1",
+  "pyright>=1.1.414",
+  "ruff>=0.16.10",
+]
+# x64dbg bridge; optional so the tool works without a debugger present.
+dbg = [
+  "pyzmq>=27.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.33,<0.12"]
+build-backend = "uv_build"
+
+# `uv_build` wants one importable root module and, by default, a package
+# directory per name.  This project deliberately ships loose modules (`cli.py`,
+# `backup.py`) *and* packages (`pe/`, `disk/`, ...) side by side in a flat
+# `src/`, so neither default fits:
+#
+#   module-name = []   declares no single root module, which is what lets the
+#                      flat tree through instead of demanding src/mumu_patch/.
+#   namespace = true   takes the tree as-is rather than expecting an
+#                      __init__.py per top-level name.
+#   data.purelib       is what actually puts the modules in the wheel.  With
+#                      module-name = [] alone the build succeeds but produces a
+#                      wheel containing nothing but .dist-info; tests/test_build
+#                      asserts the manifest so that trap cannot come back.
+#
+# The result is a wheel that installs through the `.data/purelib/` directory
+# rather than at the archive root.  pip and uv both handle that correctly -- the
+# modules land in site-packages either way -- but it is not the layout a
+# packager would choose by hand, so it is asserted rather than assumed.
+[tool.uv.build-backend]
+module-root = "src"
+module-name = []
+namespace = true
+
+[tool.uv.build-backend.data]
+purelib = "src"
+
+# `src/prebuilts/` travels with the code by virtue of sitting inside the module
+# root: the launcher APK `niulai-patch lawnchair` installs, and the startup
+# artwork `niulai-patch splash --bundled` writes.  Both are build artifacts
+# rather than Python source, and both are verified by SHA-256 in lawnchair.py /
+# splash.py.  `pe/patches/` likewise carries the declarative TOML profiles.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `uv_build`'s editable install *copies* the modules into site-packages instead
+# of adding src/ to the path, and that copy shadows the live tree.  Putting src/
+# on sys.path first means the suite always exercises the checkout, so an edit is
+# visible to the tests without reinstalling.
+pythonpath = ["src"]
+markers = [
+  "slow: builds a distribution with `uv build` (deselect with -m 'not slow')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"

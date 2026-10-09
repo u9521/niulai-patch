@@ -1,0 +1,678 @@
+diff --git a/quickstep/src/com/android/quickstep/TouchInteractionService.java b/quickstep/src/com/android/quickstep/TouchInteractionService.java
+index 1485172..26348c7 100644
+--- a/quickstep/src/com/android/quickstep/TouchInteractionService.java
++++ b/quickstep/src/com/android/quickstep/TouchInteractionService.java
+@@ -180,29 +180,59 @@ public class TouchInteractionService extends Service {
+             mTis = new WeakReference<>(tis);
+         }
+ 
++        /**
++         * Read a shell external interface out of the init bundle.
++         *
++         * <p>AOSP keys each one by an {@code extra_shell_*} name; the SystemUI on
++         * MuMu 15 keys it by the interface's AIDL descriptor instead, because
++         * {@code ShellController} builds the bundle by walking its
++         * external-interface map and the controllers there register under the
++         * descriptor. Both spellings are tried so the launcher works either way;
++         * without this every lookup returns null and the features that depend on
++         * those binders silently take their "unavailable" path — which is what
++         * made the Recents gesture do nothing at all, since
++         * {@code SystemUiProxy.startRecentsActivity} returns false whenever
++         * {@code mRecentTasks} is null.
++         */
++        private static IBinder externalInterface(Bundle bundle, String aospKey,
++                String descriptor) {
++            IBinder binder = bundle.getBinder(descriptor);
++            return binder != null ? binder : bundle.getBinder(aospKey);
++        }
++
+         @BinderThread
+         public void onInitialize(Bundle bundle) {
+             ISystemUiProxy proxy = ISystemUiProxy.Stub.asInterface(
+                     bundle.getBinder(KEY_EXTRA_SYSUI_PROXY));
+-            IPip pip = IPip.Stub.asInterface(bundle.getBinder(KEY_EXTRA_SHELL_PIP));
+-            IBubbles bubbles = IBubbles.Stub.asInterface(bundle.getBinder(KEY_EXTRA_SHELL_BUBBLES));
+-            ISplitScreen splitscreen = ISplitScreen.Stub.asInterface(bundle.getBinder(
+-                    KEY_EXTRA_SHELL_SPLIT_SCREEN));
++            IPip pip = IPip.Stub.asInterface(
++                    externalInterface(bundle, KEY_EXTRA_SHELL_PIP, "com.android.wm.shell.common.pip.IPip"));
++            IBubbles bubbles = IBubbles.Stub.asInterface(
++                    externalInterface(bundle, KEY_EXTRA_SHELL_BUBBLES,
++                            "com.android.wm.shell.bubbles.IBubbles"));
++            ISplitScreen splitscreen = ISplitScreen.Stub.asInterface(
++                    externalInterface(bundle, KEY_EXTRA_SHELL_SPLIT_SCREEN,
++                            "com.android.wm.shell.splitscreen.ISplitScreen"));
+             IOneHanded onehanded = IOneHanded.Stub.asInterface(
+-                    bundle.getBinder(KEY_EXTRA_SHELL_ONE_HANDED));
++                    externalInterface(bundle, KEY_EXTRA_SHELL_ONE_HANDED,
++                            "com.android.wm.shell.onehanded.IOneHanded"));
+             IShellTransitions shellTransitions = IShellTransitions.Stub.asInterface(
+-                    bundle.getBinder(KEY_EXTRA_SHELL_SHELL_TRANSITIONS));
++                    externalInterface(bundle, KEY_EXTRA_SHELL_SHELL_TRANSITIONS,
++                            "com.android.wm.shell.shared.IShellTransitions"));
+             IStartingWindow startingWindow = IStartingWindow.Stub.asInterface(
+-                    bundle.getBinder(KEY_EXTRA_SHELL_STARTING_WINDOW));
++                    externalInterface(bundle, KEY_EXTRA_SHELL_STARTING_WINDOW,
++                            "com.android.wm.shell.startingsurface.IStartingWindow"));
+             ISysuiUnlockAnimationController launcherUnlockAnimationController =
+                     ISysuiUnlockAnimationController.Stub.asInterface(
+                             bundle.getBinder(KEY_EXTRA_UNLOCK_ANIMATION_CONTROLLER));
+             IRecentTasks recentTasks = IRecentTasks.Stub.asInterface(
+-                    bundle.getBinder(KEY_EXTRA_SHELL_RECENT_TASKS));
++                    externalInterface(bundle, KEY_EXTRA_SHELL_RECENT_TASKS,
++                            "com.android.wm.shell.recents.IRecentTasks"));
+             IBackAnimation backAnimation = IBackAnimation.Stub.asInterface(
+-                    bundle.getBinder(KEY_EXTRA_SHELL_BACK_ANIMATION));
++                    externalInterface(bundle, KEY_EXTRA_SHELL_BACK_ANIMATION,
++                            "com.android.wm.shell.back.IBackAnimation"));
+             IDesktopMode desktopMode = IDesktopMode.Stub.asInterface(
+-                    bundle.getBinder(KEY_EXTRA_SHELL_DESKTOP_MODE));
++                    externalInterface(bundle, KEY_EXTRA_SHELL_DESKTOP_MODE,
++                            "com.android.wm.shell.desktopmode.IDesktopMode"));
+             IUnfoldAnimation unfoldTransition = IUnfoldAnimation.Stub.asInterface(
+                     bundle.getBinder(KEY_EXTRA_UNFOLD_ANIMATION_FORWARDER));
+             IDragAndDrop dragAndDrop = IDragAndDrop.Stub.asInterface(
+diff --git a/src/android/view/IRecentsAnimationController.java b/src/android/view/IRecentsAnimationController.java
+new file mode 100644
+index 0000000..aa268f7
+--- /dev/null
++++ b/src/android/view/IRecentsAnimationController.java
+@@ -0,0 +1,366 @@
++/*
++ * Copyright (C) 2019 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.view;
++
++import android.os.Binder;
++import android.os.IBinder;
++import android.os.IInterface;
++import android.os.Parcel;
++import android.os.Parcelable;
++import android.os.RemoteException;
++import android.window.PictureInPictureSurfaceTransaction;
++import android.window.TaskSnapshot;
++import android.window.WindowAnimationState;
++
++import com.android.internal.os.IResultReceiver;
++
++/**
++ * Client-side shim for the recents-animation controller interface.
++ *
++ * <p>This is the counterpart to {@link IRecentsAnimationRunner}: MuMu 15's
++ * {@code framework.jar} has no {@code android.view.IRecentsAnimationController}
++ * because the platform moved it to {@code com.android.wm.shell.recents}. The
++ * class keeps the AOSP 15 name so the rest of the project links unchanged, and
++ * reports the newer name in {@link #DESCRIPTOR} so the binder call is accepted
++ * by MuMu's SystemUI.
++ *
++ * <p>The launcher is the client here, so only {@code Stub.Proxy} really runs;
++ * {@code Stub} exists because {@code RecentsTransitionHandler} (compiled into
++ * this APK from the wmshell sources) derives from it.
++ */
++public interface IRecentsAnimationController extends IInterface {
++
++    /** The binder interface name MuMu's SystemUI uses. */
++    String DESCRIPTOR = "com.android.wm.shell.recents.IRecentsAnimationController";
++
++    TaskSnapshot screenshotTask(int taskId) throws RemoteException;
++
++    void setFinishTaskTransaction(int taskId,
++            PictureInPictureSurfaceTransaction finishTransaction,
++            SurfaceControl leash) throws RemoteException;
++
++    void finish(boolean moveHomeToFront, boolean sendUserLeaveHint,
++            IResultReceiver finishReceiver) throws RemoteException;
++
++    void setInputConsumerEnabled(boolean enabled) throws RemoteException;
++
++    void setAnimationTargetsBehindSystemBars(boolean behindSystemBars)
++            throws RemoteException;
++
++    void cleanupScreenshot() throws RemoteException;
++
++    void setDeferCancelUntilNextTransition(boolean defer, boolean screenshot)
++            throws RemoteException;
++
++    void setWillFinishToHome(boolean willFinishToHome) throws RemoteException;
++
++    boolean removeTask(int taskId) throws RemoteException;
++
++    void detachNavigationBarFromApp(boolean moveHomeToFront) throws RemoteException;
++
++    void animateNavigationBarToApp(long duration) throws RemoteException;
++
++    void handOffAnimation(RemoteAnimationTarget[] appTargets,
++            WindowAnimationState[] states) throws RemoteException;
++
++    abstract class Stub extends Binder implements IRecentsAnimationController {
++
++        // Transaction numbers as MuMu's SystemUI implements them. The platform
++        // this image runs on numbers only seven of the twelve methods above;
++        // the rest have no transaction at all and are answered locally by the
++        // proxy (see Proxy below), which is why there are no constants for
++        // them. Using AOSP 15's 1..12 numbering here would silently address the
++        // wrong methods on the other side.
++        static final int TRANSACTION_screenshotTask = 1;
++        static final int TRANSACTION_setFinishTaskTransaction = 2;
++        static final int TRANSACTION_finish = 3;
++        static final int TRANSACTION_setInputConsumerEnabled = 4;
++        static final int TRANSACTION_setWillFinishToHome = 5;
++        static final int TRANSACTION_detachNavigationBarFromApp = 6;
++        static final int TRANSACTION_handOffAnimation = 7;
++
++        public Stub() {
++            attachInterface(this, DESCRIPTOR);
++        }
++
++        public static IRecentsAnimationController asInterface(IBinder obj) {
++            if (obj == null) {
++                return null;
++            }
++            IInterface local = obj.queryLocalInterface(DESCRIPTOR);
++            if (local instanceof IRecentsAnimationController) {
++                return (IRecentsAnimationController) local;
++            }
++            return new Proxy(obj);
++        }
++
++        @Override
++        public IBinder asBinder() {
++            return this;
++        }
++
++        @Override
++        public boolean onTransact(int code, Parcel data, Parcel reply, int flags)
++                throws RemoteException {
++            switch (code) {
++                case INTERFACE_TRANSACTION: {
++                    reply.writeString(DESCRIPTOR);
++                    return true;
++                }
++                case TRANSACTION_screenshotTask: {
++                    data.enforceInterface(DESCRIPTOR);
++                    int taskId = data.readInt();
++                    data.enforceNoDataAvail();
++                    TaskSnapshot result = screenshotTask(taskId);
++                    reply.writeNoException();
++                    reply.writeTypedObject(result, Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
++                    return true;
++                }
++                case TRANSACTION_setFinishTaskTransaction: {
++                    data.enforceInterface(DESCRIPTOR);
++                    int taskId = data.readInt();
++                    PictureInPictureSurfaceTransaction finishTransaction =
++                            data.readTypedObject(PictureInPictureSurfaceTransaction.CREATOR);
++                    SurfaceControl leash = data.readTypedObject(SurfaceControl.CREATOR);
++                    data.enforceNoDataAvail();
++                    setFinishTaskTransaction(taskId, finishTransaction, leash);
++                    reply.writeNoException();
++                    return true;
++                }
++                case TRANSACTION_finish: {
++                    data.enforceInterface(DESCRIPTOR);
++                    boolean moveHomeToFront = data.readBoolean();
++                    boolean sendUserLeaveHint = data.readBoolean();
++                    IResultReceiver finishReceiver =
++                            IResultReceiver.Stub.asInterface(data.readStrongBinder());
++                    data.enforceNoDataAvail();
++                    finish(moveHomeToFront, sendUserLeaveHint, finishReceiver);
++                    reply.writeNoException();
++                    return true;
++                }
++                case TRANSACTION_setInputConsumerEnabled: {
++                    data.enforceInterface(DESCRIPTOR);
++                    boolean enabled = data.readBoolean();
++                    data.enforceNoDataAvail();
++                    setInputConsumerEnabled(enabled);
++                    reply.writeNoException();
++                    return true;
++                }
++                case TRANSACTION_setWillFinishToHome: {
++                    data.enforceInterface(DESCRIPTOR);
++                    boolean willFinishToHome = data.readBoolean();
++                    data.enforceNoDataAvail();
++                    setWillFinishToHome(willFinishToHome);
++                    reply.writeNoException();
++                    return true;
++                }
++                case TRANSACTION_detachNavigationBarFromApp: {
++                    data.enforceInterface(DESCRIPTOR);
++                    boolean moveHomeToFront = data.readBoolean();
++                    data.enforceNoDataAvail();
++                    detachNavigationBarFromApp(moveHomeToFront);
++                    reply.writeNoException();
++                    return true;
++                }
++                case TRANSACTION_handOffAnimation: {
++                    data.enforceInterface(DESCRIPTOR);
++                    RemoteAnimationTarget[] appTargets =
++                            data.createTypedArray(RemoteAnimationTarget.CREATOR);
++                    WindowAnimationState[] states =
++                            data.createTypedArray(WindowAnimationState.CREATOR);
++                    data.enforceNoDataAvail();
++                    handOffAnimation(appTargets, states);
++                    reply.writeNoException();
++                    return true;
++                }
++                default:
++                    return super.onTransact(code, data, reply, flags);
++            }
++        }
++
++        private static final class Proxy implements IRecentsAnimationController {
++
++            private final IBinder mRemote;
++
++            Proxy(IBinder remote) {
++                mRemote = remote;
++            }
++
++            @Override
++            public IBinder asBinder() {
++                return mRemote;
++            }
++
++            public String getInterfaceDescriptor() {
++                return DESCRIPTOR;
++            }
++
++            @Override
++            public TaskSnapshot screenshotTask(int taskId) throws RemoteException {
++                Parcel data = Parcel.obtain();
++                Parcel reply = Parcel.obtain();
++                TaskSnapshot result;
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeInt(taskId);
++                    mRemote.transact(TRANSACTION_screenshotTask, data, reply, 0);
++                    reply.readException();
++                    result = reply.readTypedObject(TaskSnapshot.CREATOR);
++                } finally {
++                    reply.recycle();
++                    data.recycle();
++                }
++                return result;
++            }
++
++            @Override
++            public void setFinishTaskTransaction(int taskId,
++                    PictureInPictureSurfaceTransaction finishTransaction,
++                    SurfaceControl leash) throws RemoteException {
++                Parcel data = Parcel.obtain();
++                Parcel reply = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeInt(taskId);
++                    data.writeTypedObject(finishTransaction, 0);
++                    data.writeTypedObject(leash, 0);
++                    mRemote.transact(TRANSACTION_setFinishTaskTransaction, data, reply, 0);
++                    reply.readException();
++                } finally {
++                    reply.recycle();
++                    data.recycle();
++                }
++            }
++
++            @Override
++            public void finish(boolean moveHomeToFront, boolean sendUserLeaveHint,
++                    IResultReceiver finishReceiver) throws RemoteException {
++                Parcel data = Parcel.obtain();
++                Parcel reply = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeBoolean(moveHomeToFront);
++                    data.writeBoolean(sendUserLeaveHint);
++                    data.writeStrongInterface(finishReceiver);
++                    mRemote.transact(TRANSACTION_finish, data, reply, 0);
++                    reply.readException();
++                } finally {
++                    reply.recycle();
++                    data.recycle();
++                }
++            }
++
++            @Override
++            public void setInputConsumerEnabled(boolean enabled) throws RemoteException {
++                Parcel data = Parcel.obtain();
++                Parcel reply = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeBoolean(enabled);
++                    mRemote.transact(TRANSACTION_setInputConsumerEnabled, data, reply, 0);
++                    reply.readException();
++                } finally {
++                    reply.recycle();
++                    data.recycle();
++                }
++            }
++
++            @Override
++            public void setWillFinishToHome(boolean willFinishToHome) throws RemoteException {
++                Parcel data = Parcel.obtain();
++                Parcel reply = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeBoolean(willFinishToHome);
++                    mRemote.transact(TRANSACTION_setWillFinishToHome, data, reply, 0);
++                    reply.readException();
++                } finally {
++                    reply.recycle();
++                    data.recycle();
++                }
++            }
++
++            @Override
++            public void detachNavigationBarFromApp(boolean moveHomeToFront)
++                    throws RemoteException {
++                Parcel data = Parcel.obtain();
++                Parcel reply = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeBoolean(moveHomeToFront);
++                    mRemote.transact(TRANSACTION_detachNavigationBarFromApp, data, reply, 0);
++                    reply.readException();
++                } finally {
++                    reply.recycle();
++                    data.recycle();
++                }
++            }
++
++            @Override
++            public void handOffAnimation(RemoteAnimationTarget[] appTargets,
++                    WindowAnimationState[] states) throws RemoteException {
++                Parcel data = Parcel.obtain();
++                Parcel reply = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeTypedArray(appTargets, 0);
++                    data.writeTypedArray(states, 0);
++                    mRemote.transact(TRANSACTION_handOffAnimation, data, reply, 0);
++                    reply.readException();
++                } finally {
++                    reply.recycle();
++                    data.recycle();
++                }
++            }
++
++            /*
++             * The four methods below have no transaction on this platform's
++             * SystemUI. They are answered locally rather than sent: a binder
++             * call to a code the server does not handle comes back without a
++             * reply, and the resulting failure surfaces as a broken gesture
++             * rather than as a logged no-op. `removeTask` reports failure for
++             * the same reason -- the task is not removed, and the caller
++             * already treats `false` as "try another route".
++             */
++
++            @Override
++            public void setAnimationTargetsBehindSystemBars(boolean behindSystemBars) {
++                // No-op: not implemented by MuMu's SystemUI.
++            }
++
++            @Override
++            public void cleanupScreenshot() {
++                // No-op: not implemented by MuMu's SystemUI.
++            }
++
++            @Override
++            public void setDeferCancelUntilNextTransition(boolean defer, boolean screenshot) {
++                // No-op: not implemented by MuMu's SystemUI.
++            }
++
++            @Override
++            public void animateNavigationBarToApp(long duration) {
++                // No-op: not implemented by MuMu's SystemUI.
++            }
++
++            @Override
++            public boolean removeTask(int taskId) {
++                return false;
++            }
++        }
++    }
++}
+diff --git a/src/android/view/IRecentsAnimationRunner.java b/src/android/view/IRecentsAnimationRunner.java
+new file mode 100644
+index 0000000..5129149
+--- /dev/null
++++ b/src/android/view/IRecentsAnimationRunner.java
+@@ -0,0 +1,226 @@
++/*
++ * Copyright (C) 2019 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.view;
++
++import android.graphics.Rect;
++import android.os.Binder;
++import android.os.Bundle;
++import android.os.IBinder;
++import android.os.IInterface;
++import android.os.Parcel;
++import android.os.RemoteException;
++import android.window.TaskSnapshot;
++
++/**
++ * Client-side shim for the recents-animation callback interface.
++ *
++ * <p>MuMu 15's {@code framework.jar} does not contain
++ * {@code android.view.IRecentsAnimationRunner} — the platform moved this AIDL to
++ * {@code com.android.wm.shell.recents} before that release. The class is
++ * nevertheless named here exactly as the AOSP 15 interface
++ * ({@code android.view.IRecentsAnimationRunner}) so that the rest of this
++ * project compiles and links against it unchanged, while {@link #DESCRIPTOR}
++ * carries the name MuMu's SystemUI actually puts on the wire.
++ *
++ * <p>Without this file the launcher's dex refers to
++ * {@code Landroid/view/IRecentsAnimationRunner$Stub;}, which resolves nowhere:
++ * not in the boot classpath (absent there) and not in the APK itself, because
++ * {@code framework-15.jar} is a {@code compileOnly} dependency. ART then throws
++ * {@code NoClassDefFoundError} while verifying
++ * {@code ActivityManagerCompatVV}, which kills {@code TouchInteractionService}
++ * during {@code onCreate} and leaves every APP_SWITCH inside a queued command
++ * that never completes.
++ *
++ * @see IRecentsAnimationController
++ */
++public interface IRecentsAnimationRunner extends IInterface {
++
++    /**
++     * The binder interface name MuMu's SystemUI uses. This is deliberately not
++     * {@code android.view.IRecentsAnimationRunner}: the platform on this image
++     * speaks the newer {@code com.android.wm.shell.recents} protocol.
++     */
++    String DESCRIPTOR = "com.android.wm.shell.recents.IRecentsAnimationRunner";
++
++    void onAnimationCanceled(int[] taskIds, TaskSnapshot[] taskSnapshots)
++            throws RemoteException;
++
++    void onAnimationStart(IRecentsAnimationController controller,
++            RemoteAnimationTarget[] appTargets, RemoteAnimationTarget[] wallpaperTargets,
++            Rect homeContentInsets, Rect minimizedHomeBounds, Bundle options)
++            throws RemoteException;
++
++    void onTasksAppeared(RemoteAnimationTarget[] appTargets) throws RemoteException;
++
++    /**
++     * Local-side implementation. The launcher is the server here: SystemUI
++     * calls these three methods back, and the transaction numbers below are
++     * taken from MuMu's own SystemUI rather than from AOSP 15 (which numbered
++     * the same methods 1, 2 and 3).
++     */
++    abstract class Stub extends Binder implements IRecentsAnimationRunner {
++
++        static final int TRANSACTION_onAnimationCanceled = 2;
++        static final int TRANSACTION_onAnimationStart = 3;
++        static final int TRANSACTION_onTasksAppeared = 4;
++
++        public Stub() {
++            attachInterface(this, DESCRIPTOR);
++        }
++
++        /**
++         * Turn a raw binder into the interface, without reflection: the caller
++         * is on the hot path of a gesture, and a {@code Class.forName} miss here
++         * would be indistinguishable from the class-resolution failure this
++         * file exists to prevent.
++         */
++        public static IRecentsAnimationRunner asInterface(IBinder obj) {
++            if (obj == null) {
++                return null;
++            }
++            IInterface local = obj.queryLocalInterface(DESCRIPTOR);
++            if (local instanceof IRecentsAnimationRunner) {
++                return (IRecentsAnimationRunner) local;
++            }
++            return new Proxy(obj);
++        }
++
++        @Override
++        public IBinder asBinder() {
++            return this;
++        }
++
++        @Override
++        public boolean onTransact(int code, Parcel data, Parcel reply, int flags)
++                throws RemoteException {
++            switch (code) {
++                case INTERFACE_TRANSACTION: {
++                    reply.writeString(DESCRIPTOR);
++                    return true;
++                }
++                case TRANSACTION_onAnimationCanceled: {
++                    data.enforceInterface(DESCRIPTOR);
++                    int[] taskIds = data.createIntArray();
++                    TaskSnapshot[] taskSnapshots =
++                            data.createTypedArray(TaskSnapshot.CREATOR);
++                    data.enforceNoDataAvail();
++                    onAnimationCanceled(taskIds, taskSnapshots);
++                    reply.writeNoException();
++                    return true;
++                }
++                case TRANSACTION_onAnimationStart: {
++                    data.enforceInterface(DESCRIPTOR);
++                    IRecentsAnimationController controller =
++                            IRecentsAnimationController.Stub.asInterface(
++                                    data.readStrongBinder());
++                    RemoteAnimationTarget[] appTargets =
++                            data.createTypedArray(RemoteAnimationTarget.CREATOR);
++                    RemoteAnimationTarget[] wallpaperTargets =
++                            data.createTypedArray(RemoteAnimationTarget.CREATOR);
++                    Rect homeContentInsets = data.readTypedObject(Rect.CREATOR);
++                    Rect minimizedHomeBounds = data.readTypedObject(Rect.CREATOR);
++                    Bundle options = data.readTypedObject(Bundle.CREATOR);
++                    data.enforceNoDataAvail();
++                    onAnimationStart(controller, appTargets, wallpaperTargets,
++                            homeContentInsets, minimizedHomeBounds, options);
++                    reply.writeNoException();
++                    return true;
++                }
++                case TRANSACTION_onTasksAppeared: {
++                    data.enforceInterface(DESCRIPTOR);
++                    RemoteAnimationTarget[] appTargets =
++                            data.createTypedArray(RemoteAnimationTarget.CREATOR);
++                    data.enforceNoDataAvail();
++                    onTasksAppeared(appTargets);
++                    reply.writeNoException();
++                    return true;
++                }
++                default:
++                    return super.onTransact(code, data, reply, flags);
++            }
++        }
++
++        private static final class Proxy implements IRecentsAnimationRunner {
++
++            private final IBinder mRemote;
++
++            Proxy(IBinder remote) {
++                mRemote = remote;
++            }
++
++            @Override
++            public IBinder asBinder() {
++                return mRemote;
++            }
++
++            public String getInterfaceDescriptor() {
++                return DESCRIPTOR;
++            }
++
++            @Override
++            public void onAnimationCanceled(int[] taskIds, TaskSnapshot[] taskSnapshots)
++                    throws RemoteException {
++                Parcel data = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeIntArray(taskIds);
++                    data.writeTypedArray(taskSnapshots, 0);
++                    mRemote.transact(TRANSACTION_onAnimationCanceled, data, null,
++                            IBinder.FLAG_ONEWAY);
++                } finally {
++                    data.recycle();
++                }
++            }
++
++            @Override
++            public void onAnimationStart(IRecentsAnimationController controller,
++                    RemoteAnimationTarget[] appTargets,
++                    RemoteAnimationTarget[] wallpaperTargets,
++                    Rect homeContentInsets, Rect minimizedHomeBounds, Bundle options)
++                    throws RemoteException {
++                Parcel data = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeStrongInterface(controller);
++                    data.writeTypedArray(appTargets, 0);
++                    data.writeTypedArray(wallpaperTargets, 0);
++                    data.writeTypedObject(homeContentInsets, 0);
++                    data.writeTypedObject(minimizedHomeBounds, 0);
++                    data.writeTypedObject(options, 0);
++                    mRemote.transact(TRANSACTION_onAnimationStart, data, null,
++                            IBinder.FLAG_ONEWAY);
++                } finally {
++                    data.recycle();
++                }
++            }
++
++            @Override
++            public void onTasksAppeared(RemoteAnimationTarget[] appTargets)
++                    throws RemoteException {
++                Parcel data = Parcel.obtain();
++                try {
++                    data.writeInterfaceToken(DESCRIPTOR);
++                    data.writeTypedArray(appTargets, 0);
++                    mRemote.transact(TRANSACTION_onTasksAppeared, data, null,
++                            IBinder.FLAG_ONEWAY);
++                } finally {
++                    data.recycle();
++                }
++            }
++        }
++    }
++}
